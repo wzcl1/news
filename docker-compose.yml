@@ -5,3 +5,9 @@ services:
     ports:
       - "5008:5008"
     restart: unless-stopped
+    networks:
+      - edge
+
+networks:
+  edge:
+    external: true
