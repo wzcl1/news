@@ -1,0 +1,7 @@
+services:
+  smh-bypass:
+    build: .
+    container_name: smh-bypass
+    ports:
+      - "5008:5008"
+    restart: unless-stopped
