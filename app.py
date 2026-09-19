@@ -8,18 +8,22 @@ Article pages get clean text extraction from embedded JSON.
 SMH routes:  / , /<path>
 AFR routes:  /afr , /afr/<path>
 """
+import os
 import re
 import json
 import logging
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
-from flask import Flask, request, Response, abort
+from urllib.parse import urljoin, urlparse
+from flask import Flask, request, Response
 import requests
 from bs4 import BeautifulSoup
+from markupsafe import escape
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=os.environ.get("SMH_LOG_LEVEL", "INFO").upper())
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+SESSION = requests.Session()
 
 UPSTREAM = "https://www.smh.com.au"
 
@@ -54,14 +58,17 @@ SKIP_EXTENSIONS = {
     ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".webp",
 }
 
-# Paywall-related URL patterns to block
+# Paywall-related URL patterns to block (compiled)
 BLOCK_PATTERNS = [
-    r"piano\.io",
-    r"tinypass\.com",
-    r"poool\.",
-    r"paywall",
-    r"metering",
-    r"subscribe",
+    re.compile(p, re.I)
+    for p in (
+        r"piano\.io",
+        r"tinypass",
+        r"poool\.",
+        r"paywall",
+        r"metering",
+        r"subscribe",
+    )
 ]
 
 # ── AFR-specific constants ──────────────────────────────────────────────────
@@ -77,61 +84,70 @@ AFR_DOMAINS = [
     "watoday.com.au",
 ]
 
+# Superset of BLOCK_PATTERNS plus AFR-specific trackers (compiled).
+# Entries subsumed by a broader pattern (e.g. buy-au.piano.io ⊂ piano.io,
+# tinypass.min.js ⊂ tinypass, partner.googleadservices ⊂ googleadservices)
+# are omitted.
 AFR_BLOCK_PATTERNS = [
-    r"piano\.io",
-    r"tinypass\.com",
-    r"poool\.",
-    r"paywall",
-    r"metering",
-    r"subscribe",
-    r"tinypass\.min\.js",
-    r"buy-au\.piano\.io",
-    r"c2-au\.piano\.io",
-    r"gtm\.js",
-    r"snowplow",
-    r"alib\.nine\.com\.au",
-    r"adkit\.9pub",
-    r"googletagmanager",
-    r"googleadservices",
-    r"doubleclick",
-    r"googlesyndication",
-    r"c2-au\.piano\.io",
-    r"tp\.push",
-    r"tp\.pianoId",
-    r"tinypass",
-    r"afx_prid",
-    r"partner\.googleadservices",
-    r"securepubads\.g\.doubleclick",
-    r"tpc\.googlesyndication",
+    re.compile(p, re.I)
+    for p in (
+        r"piano\.io",
+        r"tinypass",
+        r"poool\.",
+        r"paywall",
+        r"metering",
+        r"subscribe",
+        r"gtm\.js",
+        r"snowplow",
+        r"alib\.nine\.com\.au",
+        r"adkit\.9pub",
+        r"googletagmanager",
+        r"googleadservices",
+        r"doubleclick",
+        r"googlesyndication",
+        r"tp\.push",
+        r"tp\.pianoId",
+        r"afx_prid",
+    )
 ]
 
 
-def make_proxy_url(path, qs=""):
-    """Build a proxy URL for a given upstream path."""
-    if qs:
-        return f"/{path}?{qs}"
-    return f"/{path}"
+def rewrite_url(url, base_url, domains, prefix=""):
+    """Convert a URL to route through the proxy. Returns rewritten URL string.
 
-
-def rewrite_url(url, base_url):
-    """Convert a URL to route through the proxy. Returns rewritten URL string."""
+    ``prefix`` is "" for the SMH proxy (served at /) and "/afr" for the
+    AFR proxy.
+    """
     if not url or url.startswith(("#", "javascript:", "mailto:", "tel:")):
         return url
 
-    # Already a proxy URL
+    # Root-relative URL
     if url.startswith("/"):
-        return url
+        if not prefix:
+            # SMH: already proxy-relative
+            return url
+        if url == prefix or url.startswith(prefix + "/"):
+            return url
+        if url.startswith(("/assets/", "/fonts/", "/favicon", "/apple-touch-icon", "/manifest")):
+            return url
+        last = url.rsplit("/", 1)[-1]
+        ext = "." + last.rsplit(".", 1)[-1].lower() if "." in last else ""
+        if ext in SKIP_EXTENSIONS:
+            return url
+        if "?" in url:
+            path, qs = url.lstrip("/").split("?", 1)
+            return f"{prefix}/{path}?{qs}"
+        return f"{prefix}/{url.lstrip('/')}"
 
     # Absolute URL
     parsed = urlparse(url)
     if parsed.scheme in ("http", "https"):
-        # Check if it's a Nine domain
         host = parsed.hostname or ""
-        if any(host.endswith(d) for d in NINE_DOMAINS):
+        if any(host.endswith(d) for d in domains):
             path = parsed.path.lstrip("/")
             if parsed.query:
-                return f"/{path}?{parsed.query}"
-            return f"/{path}"
+                return f"{prefix}/{path}?{parsed.query}"
+            return f"{prefix}/{path}"
         # External link — leave as-is
         return url
 
@@ -139,11 +155,11 @@ def rewrite_url(url, base_url):
     resolved = urljoin(base_url, url)
     parsed = urlparse(resolved)
     host = parsed.hostname or ""
-    if any(host.endswith(d) for d in NINE_DOMAINS):
-        path = parsed.path.lstrip("/")
-        if parsed.query:
-            return f"/{path}?{parsed.query}"
-        return f"/{path}"
+    if any(host.endswith(d) for d in domains):
+        return rewrite_url(
+            parsed.path + (f"?{parsed.query}" if parsed.query else ""),
+            base_url, domains, prefix,
+        )
 
     return url
 
@@ -202,56 +218,78 @@ def _strip_footer_below_socials(soup):
             node = node.parent
 
 
-def strip_page_chrome(html):
-    """Remove partner sections, ad slots, login prompts and footer cruft."""
+PAYWALL_SELECTORS = [
+    '#paywall_prompt',
+    '#paywall-piano',
+    '#subscribe',
+    '[data-testid="PianoContainer"]',
+    '[data-testid="PianoSubButton"]',
+    '#tp-iframe',
+    '.paywall',
+    '.regwall',
+    '.gateway',
+    '.meter-wall',
+]
+
+PAYWALL_CLASS_RE = re.compile(r"paywall|subscribe-prompt|regwall|gateway|meter-wall", re.I)
+PAYWALL_ID_RE = re.compile(r"piano|tp-|tif-wrapper", re.I)
+ADSPOT_ID_RE = re.compile(r"adspot|ad-slot|consent|cookie", re.I)
+
+STATE_SCRIPT_MARKERS = ("__redux_state__", "__apollo_state__", "__staticrouterydrationdata")
+
+
+def process_html(html, base_url, domains, prefix, block_patterns,
+                 extra_id_re=None, strip_state_scripts=False):
+    """Single-pass cleanup of proxied HTML.
+
+    Strips paywall/tracking scripts, paywall and ad containers, partner
+    sections, named sections and footer cruft, then rewrites all
+    href/src/action attributes to route through the proxy.
+    """
     if not html:
         return html
     soup = BeautifulSoup(html, "html.parser")
 
-    for sel in PARTNER_SELECTORS + AD_SELECTORS:
-        for el in soup.select(sel):
-            el.decompose()
-
-    _strip_named_sections(soup)
-    _strip_footer_below_socials(soup)
-
-    return str(soup)
-
-
-def rewrite_html_links(html, upstream_url):
-    """Rewrite all href/src/action attributes in HTML to route through the proxy."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Paywall script/link removal
+    # Paywall/tracking script removal
     for tag in soup.find_all("script"):
         src = (tag.get("src") or "").lower()
         body = (tag.string or "").lower()
         blob = src + " " + body
-        if any(re.search(p, blob) for p in BLOCK_PATTERNS):
+        if any(p.search(blob) for p in block_patterns):
+            tag.decompose()
+            continue
+        if strip_state_scripts and any(m in blob for m in STATE_SCRIPT_MARKERS):
             tag.decompose()
 
     for tag in soup.find_all("link"):
         href = (tag.get("href") or "").lower()
-        if any(re.search(p, href) for p in BLOCK_PATTERNS):
+        if any(p.search(href) for p in block_patterns):
             tag.decompose()
 
-    # Paywall element removal
-    for sel in ["#paywall_prompt", "#paywall-piano", "#subscribe"]:
+    # Paywall / partner / ad element removal
+    for sel in PAYWALL_SELECTORS + PARTNER_SELECTORS + AD_SELECTORS:
         for el in soup.select(sel):
             el.decompose()
 
-    for el in soup.find_all(True, class_=re.compile(r"paywall|subscribe-prompt|regwall|gateway|meter-wall", re.I)):
+    for el in soup.find_all(True, class_=PAYWALL_CLASS_RE):
         el.decompose()
 
-    for el in soup.find_all(True, id=re.compile(r"piano|tp-|tif-wrapper", re.I)):
+    for el in soup.find_all(True, id=PAYWALL_ID_RE):
         el.decompose()
+
+    if extra_id_re is not None:
+        for el in soup.find_all(True, id=extra_id_re):
+            el.decompose()
+
+    _strip_named_sections(soup)
+    _strip_footer_below_socials(soup)
 
     # Rewrite link attributes
     for tag in soup.find_all(True):
         for attr in ("href", "src", "action"):
             val = tag.get(attr)
             if val:
-                tag[attr] = rewrite_url(val, upstream_url)
+                tag[attr] = rewrite_url(val, base_url, domains, prefix)
 
     # Fix base tag if present
     base = soup.find("base")
@@ -261,13 +299,14 @@ def rewrite_html_links(html, upstream_url):
     return str(soup)
 
 
+APOLLO_SCRIPT_RE = re.compile(r"<script[^>]*>(.*?)</script>", re.DOTALL | re.I)
+
+
 def extract_article_data(html):
     """Extract article body from embedded APOLLO_STATE JSON."""
-    soup = BeautifulSoup(html, "html.parser")
-
     hydration_data = None
-    for script in soup.find_all("script"):
-        text = script.string or ""
+    for m in APOLLO_SCRIPT_RE.finditer(html):
+        text = m.group(1)
         marker = "window.APOLLO_STATE"
         idx = text.find(marker)
         if idx == -1:
@@ -377,8 +416,8 @@ def _resolve_placeholders(markup, placeholders, asset_urls=None):
             if any(host.endswith(d) for d in NINE_DOMAINS):
                 url = parsed.path
         if url and text:
-            return f'<a href="{url}">{text}</a>'
-        return text
+            return f'<a href="{escape(url)}">{escape(text)}</a>'
+        return escape(text)
 
     markup = re.sub(r"<x-placeholder[^>]*>.*?</x-placeholder>", replacer, markup, flags=re.DOTALL)
     markup = re.sub(r"<x-placeholder[^>]*/?>", replacer, markup)
@@ -409,16 +448,16 @@ def blocks_to_html(blocks, asset_urls=None):
             credit = img.get("credit", "")
             if media_id:
                 src = f"https://static.ffx.io/images/$width_756,q_86,f_auto/{media_id}"
-                parts.append(f'<img src="{src}" alt="{caption}">')
+                parts.append(f'<img src="{src}" alt="{escape(caption)}">')
                 if caption:
-                    parts.append(f'<p class="caption">{caption} ({credit})</p>')
+                    parts.append(f'<p class="caption">{escape(caption)} ({escape(credit)})</p>')
 
         elif btype == "QUOTE":
             markup = block.get("markup", "")
             markup = re.sub(r"\\u([0-9a-fA-F]{4})",
-                           lambda m: chr(int(m.group(1), 16)), markup)
+                            lambda m: chr(int(m.group(1), 16)), markup)
             byline = block.get("byline", "")
-            parts.append(f"<blockquote>{markup}<br><small>&mdash; {byline}</small></blockquote>")
+            parts.append(f"<blockquote>{markup}<br><small>&mdash; {escape(byline)}</small></blockquote>")
 
         elif btype == "IFRAME":
             url = block.get("url", "")
@@ -446,10 +485,6 @@ def _parse_initial_state(html):
         return json.loads(inner)
     except (json.JSONDecodeError, ValueError):
         return None
-
-
-def _brand_for_path(path):
-    return "smh"
 
 
 def _iter_index_asset_ids(page_data):
@@ -482,7 +517,7 @@ def extract_index_meta(html):
         return {
             "kind": "nav",
             "path": page_data.get("contentPath") or key,
-            "brand": _brand_for_path(key),
+            "brand": "smh",
             "shown_ids": ids,
         }
     return None
@@ -507,20 +542,24 @@ def extract_topic_meta(path, html):
     }
 
 
+GRAPHQL_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": HEADERS["User-Agent"],
+    "Origin": UPSTREAM,
+    "Referer": UPSTREAM + "/",
+}
+
+
 def _graphql_post(query, variables):
-    """POST a query to the FFX GraphQL API and return the assetsConnection."""
-    payload = {"query": query, "variables": variables}
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": HEADERS["User-Agent"],
-        "Origin": UPSTREAM,
-        "Referer": UPSTREAM + "/",
-    }
-    resp = requests.post(GRAPHQL_URL, json=payload, headers=headers, timeout=15)
+    """POST a query to the FFX GraphQL API and return the data dict."""
+    resp = SESSION.post(
+        GRAPHQL_URL,
+        json={"query": query, "variables": variables},
+        headers=GRAPHQL_HEADERS,
+        timeout=15,
+    )
     resp.raise_for_status()
-    data = resp.json()
-    conn = (data.get("data") or {}).get("assetsConnection") or {}
-    return conn.get("assets", []), conn.get("pageInfo", {})
+    return resp.json().get("data") or {}
 
 
 ASSET_FIELDS = (
@@ -546,7 +585,8 @@ def graphql_more(path, brand, since, count=12):
         "since": since,
         "types": NAV_ASSET_TYPES,
     }
-    return _graphql_post(query, variables)
+    conn = _graphql_post(query, variables).get("assetsConnection") or {}
+    return conn.get("assets", []), conn.get("pageInfo", {})
 
 
 def graphql_tag_more(tag_id, brand, since, count=12):
@@ -576,16 +616,8 @@ def graphql_most_popular(brand, count=6):
         "mostPopularStories(brand:$brand,count:$count){"
         + MOST_POPULAR_FIELDS + "}}"
     )
-    payload = {"query": query, "variables": {"brand": brand, "count": count}}
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": HEADERS["User-Agent"],
-        "Origin": UPSTREAM,
-        "Referer": UPSTREAM + "/",
-    }
-    resp = requests.post(GRAPHQL_URL, json=payload, headers=headers, timeout=15)
-    resp.raise_for_status()
-    return (resp.json().get("data") or {}).get("mostPopularStories") or []
+    data = _graphql_post(query, {"brand": brand, "count": count})
+    return data.get("mostPopularStories") or []
 
 
 
@@ -604,11 +636,11 @@ def render_more_cards(assets):
             src = f"https://static.ffx.io/images/$width_400,q_86,f_auto/{img_id}"
             img_html = f'<img class="__smh_card_img" src="{src}" alt="" loading="lazy">'
 
-        about_html = f'<p class="__smh_card_about">{about}</p>' if about else ""
+        about_html = f'<p class="__smh_card_about">{escape(about)}</p>' if about else ""
         cards.append(
-            f'<article class="__smh_card" data-id="{aid}">'
+            f'<article class="__smh_card" data-id="{escape(aid)}">'
             f'{img_html}'
-            f'<h3 class="__smh_card_title"><a href="{path}">{headline}</a></h3>'
+            f'<h3 class="__smh_card_title"><a href="{escape(path)}">{escape(headline)}</a></h3>'
             f'{about_html}'
             f'</article>'
         )
@@ -633,9 +665,14 @@ SHOW_MORE_CSS = """
 """
 
 
+def _js_json(value):
+    """JSON-encode a value for safe embedding inside a <script> tag."""
+    return json.dumps(value).replace("</", "<\\/")
+
+
 def inject_show_more(html, meta):
     """Inject a working 'Show more' button + JS into an index page."""
-    shown = json.dumps(meta.get("shown_ids", []))
+    shown = _js_json(meta.get("shown_ids", []))
 
     script = SHOW_MORE_CSS + """
 <div id="__smh_more_container"></div>
@@ -719,10 +756,10 @@ def inject_show_more(html, meta):
 </script>
 """
     script = (script
-              .replace("%KIND%", json.dumps(meta.get("kind", "nav")))
-              .replace("%PATH%", json.dumps(meta.get("path", "")))
-              .replace("%TAG%", json.dumps(meta.get("tag_id", "")))
-              .replace("%BRAND%", json.dumps(meta["brand"]))
+              .replace("%KIND%", _js_json(meta.get("kind", "nav")))
+              .replace("%PATH%", _js_json(meta.get("path", "")))
+              .replace("%TAG%", _js_json(meta.get("tag_id", "")))
+              .replace("%BRAND%", _js_json(meta["brand"]))
               .replace("%SHOWN%", shown))
 
     # Insert before the footer so new cards appear at the end of the content.
@@ -1009,150 +1046,6 @@ ARTICLE_TEMPLATE = """<!doctype html>
 # ── AFR-specific functions ──────────────────────────────────────────────────
 
 
-def afr_rewrite_url(url, base_url):
-    """Convert an AFR URL to route through the proxy."""
-    if not url or url.startswith(("#", "javascript:", "mailto:", "tel:")):
-        return url
-
-    # Already an AFR proxy URL
-    if url == "/afr" or url.startswith("/afr/"):
-        return url
-
-    # Absolute URL
-    parsed = urlparse(url)
-    if parsed.scheme in ("http", "https"):
-        host = parsed.hostname or ""
-        if any(host.endswith(d) for d in AFR_DOMAINS):
-            path = parsed.path.lstrip("/")
-            if parsed.query:
-                return f"/afr/{path}?{parsed.query}"
-            return f"/afr/{path}"
-        return url
-
-    # Root-relative URL — leave static assets alone, prefix everything else
-    if url.startswith("/"):
-        if url.startswith(("/assets/", "/fonts/", "/favicon", "/apple-touch-icon", "/manifest")):
-            return url
-        ext = url.rsplit(".", 1)[-1].lower() if "." in url.rsplit("/", 1)[-1] else ""
-        if ext in SKIP_EXTENSIONS:
-            return url
-        if "?" in url:
-            path, qs = url.lstrip("/").split("?", 1)
-            return f"/afr/{path}?{qs}"
-        return f"/afr/{url.lstrip('/')}"
-
-    # Relative URL — resolve against base
-    resolved = urljoin(base_url, url)
-    parsed = urlparse(resolved)
-    host = parsed.hostname or ""
-    if any(host.endswith(d) for d in AFR_DOMAINS):
-        return afr_rewrite_url(parsed.path + (f"?{parsed.query}" if parsed.query else ""), base_url)
-
-    return url
-
-
-def afr_strip_paywall(html):
-    """Strip paywall elements, tracking scripts, and ads from AFR HTML."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Remove tracking/paywall/ad scripts
-    for tag in soup.find_all("script"):
-        src = (tag.get("src") or "").lower()
-        body = (tag.string or "").lower()
-        blob = src + " " + body
-        if any(re.search(p, blob) for p in AFR_BLOCK_PATTERNS):
-            tag.decompose()
-
-    # Remove paywall-related links
-    for tag in soup.find_all("link"):
-        href = (tag.get("href") or "").lower()
-        if any(re.search(p, href) for p in AFR_BLOCK_PATTERNS):
-            tag.decompose()
-
-    # Remove paywall containers
-    for sel in [
-        '[data-testid="PianoContainer"]',
-        '[data-testid="PianoSubButton"]',
-        "#paywall_prompt",
-        "#paywall-piano",
-        "#subscribe",
-        ".paywall",
-        ".regwall",
-        ".gateway",
-        ".meter-wall",
-        "#tp-iframe",
-    ]:
-        for el in soup.select(sel):
-            el.decompose()
-
-    for el in soup.find_all(True, class_=re.compile(r"paywall|subscribe-prompt|regwall|gateway|meter-wall", re.I)):
-        el.decompose()
-
-    for el in soup.find_all(True, id=re.compile(r"piano|tp-|tif-wrapper", re.I)):
-        el.decompose()
-
-    # Remove data blocks that contain paywall state
-    for tag in soup.find_all("script"):
-        text = tag.string or ""
-        if any(p in text.lower() for p in ["__REDUX_STATE__", "__APOLLO_STATE__", "__staticRouterHydrationData"]):
-            tag.decompose()
-
-    # Remove ad/cookie consent elements
-    for el in soup.find_all(True, id=re.compile(r"adspot|ad-slot|consent|cookie", re.I)):
-        el.decompose()
-
-    return str(soup)
-
-
-def afr_rewrite_html_links(html, upstream_url):
-    """Rewrite all href/src/action attributes in AFR HTML to route through the proxy."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Paywall script/link removal
-    for tag in soup.find_all("script"):
-        src = (tag.get("src") or "").lower()
-        body = (tag.string or "").lower()
-        blob = src + " " + body
-        if any(re.search(p, blob) for p in AFR_BLOCK_PATTERNS):
-            tag.decompose()
-
-    for tag in soup.find_all("link"):
-        href = (tag.get("href") or "").lower()
-        if any(re.search(p, href) for p in AFR_BLOCK_PATTERNS):
-            tag.decompose()
-
-    # Paywall element removal
-    for sel in [
-        '[data-testid="PianoContainer"]',
-        '[data-testid="PianoSubButton"]',
-        "#paywall_prompt",
-        "#paywall-piano",
-        "#subscribe",
-    ]:
-        for el in soup.select(sel):
-            el.decompose()
-
-    for el in soup.find_all(True, class_=re.compile(r"paywall|subscribe-prompt|regwall|gateway|meter-wall", re.I)):
-        el.decompose()
-
-    for el in soup.find_all(True, id=re.compile(r"piano|tp-|tif-wrapper", re.I)):
-        el.decompose()
-
-    # Rewrite link attributes
-    for tag in soup.find_all(True):
-        for attr in ("href", "src", "action"):
-            val = tag.get(attr)
-            if val:
-                tag[attr] = afr_rewrite_url(val, upstream_url)
-
-    # Fix base tag if present
-    base = soup.find("base")
-    if base:
-        base.decompose()
-
-    return str(soup)
-
-
 def _afr_extract_hydration_data(html):
     """Extract window.__staticRouterHydrationData from AFR HTML."""
     marker = "window.__staticRouterHydrationData = JSON.parse(\""
@@ -1188,7 +1081,7 @@ def _afr_resolve_story(story_id):
 
     result = (None, None)
     try:
-        resp = requests.post(
+        resp = SESSION.post(
             AFR_GRAPHQL_URL,
             json={
                 "query": (
@@ -1210,6 +1103,8 @@ def _afr_resolve_story(story_id):
     except (requests.RequestException, json.JSONDecodeError, ValueError):
         log.warning("AFR: Failed to resolve story id %s", story_id)
 
+    if len(_afr_story_cache) > 1000:
+        _afr_story_cache.clear()
     _afr_story_cache[story_id] = result
     return result
 
@@ -1241,11 +1136,11 @@ def _afr_resolve_placeholders(body, placeholders):
                 alt = data.get("altText", "")
                 caption = data.get("caption", "")
                 credit = data.get("credit", "")
-                img_html = f'<img src="{src}" alt="{alt}">'
+                img_html = f'<img src="{src}" alt="{escape(alt)}">'
                 if caption:
-                    img_html += f'<p class="caption">{caption}'
+                    img_html += f'<p class="caption">{escape(caption)}'
                     if credit:
-                        img_html += f' ({credit})'
+                        img_html += f' ({escape(credit)})'
                     img_html += '</p>'
                 return img_html
             return ""
@@ -1256,8 +1151,8 @@ def _afr_resolve_placeholders(body, placeholders):
             new_tab = data.get("newTab", False)
             target = ' target="_blank" rel="noopener"' if new_tab else ""
             if url and text:
-                return f'<a href="{url}"{target}>{text}</a>'
-            return text
+                return f'<a href="{escape(url)}"{target}>{escape(text)}</a>'
+            return escape(text)
 
         elif ptype == "relatedStory":
             story_id = data.get("id", "")
@@ -1267,7 +1162,7 @@ def _afr_resolve_placeholders(body, placeholders):
                     text = headline or "Related story"
                     return (
                         f'<p class="related"><strong>Related:</strong> '
-                        f'<a href="/afr{path}">{text}</a></p>'
+                        f'<a href="/afr{escape(path)}">{escape(text)}</a></p>'
                     )
                 # Fallback — link to the external article directly
                 return f'<p class="related"><strong>Related:</strong> <a href="https://www.afr.com/{story_id}">Related story</a></p>'
@@ -1320,7 +1215,7 @@ def afr_extract_article_data(html):
         # Rewrite any raw AFR links in the body to go through the proxy
         def _rewrap(m):
             quote, url = m.group(1), m.group(2)
-            return f'href={quote}{afr_rewrite_url(url, "")}{quote}'
+            return f'href={quote}{rewrite_url(url, "", AFR_DOMAINS, "/afr")}{quote}'
 
         body = re.sub(r'href=(["\'])(.*?)\1', _rewrap, body)
 
@@ -1422,18 +1317,18 @@ def afr_build_article_html(article, upstream_url):
 
     overview = ""
     if article.get("about"):
-        overview = f'<div class="overview">{article["about"]}</div>'
+        overview = f'<div class="overview">{escape(article["about"])}</div>'
 
     date = (article.get("date") or "")[:10]
 
     return AFR_ARTICLE_TEMPLATE.format(
-        title=article.get("headline", ""),
+        title=escape(article.get("headline", "")),
         overview=overview,
-        byline=article.get("byline", ""),
-        date=date,
+        byline=escape(article.get("byline", "")),
+        date=escape(date),
         body=strip_promos(article.get("body", "")),
         hero_img=hero_img,
-        url=upstream_url,
+        url=escape(upstream_url),
         embed_script=EMBED_RESIZE_SCRIPT,
     )
 
@@ -1450,11 +1345,11 @@ def afr_proxy(path):
     log.debug("AFR Proxying: %s → %s", request.full_path, upstream)
 
     try:
-        resp = requests.get(upstream, headers=HEADERS, timeout=15, allow_redirects=True)
+        resp = SESSION.get(upstream, headers=HEADERS, timeout=15, allow_redirects=True)
         resp.raise_for_status()
     except requests.RequestException as e:
         log.exception("AFR: Failed to fetch upstream")
-        return f"<h1>Upstream fetch failed</h1><p>{e}</p>", 502
+        return f"<h1>Upstream fetch failed</h1><p>{escape(e)}</p>", 502
 
     content_type = resp.headers.get("Content-Type", "")
 
@@ -1474,10 +1369,13 @@ def afr_proxy(path):
         rendered = afr_build_article_html(article, upstream)
         return Response(inject_smh_ui(rendered), mimetype="text/html")
 
-    # Not an article — proxy with link rewriting
-    rewritten = afr_strip_paywall(html)
-    rewritten = afr_rewrite_html_links(rewritten, upstream + "/")
-    rewritten = strip_page_chrome(rewritten)
+    # Not an article — proxy with link rewriting (single pass)
+    rewritten = process_html(
+        html, upstream + "/", AFR_DOMAINS, "/afr",
+        AFR_BLOCK_PATTERNS,
+        extra_id_re=ADSPOT_ID_RE,
+        strip_state_scripts=True,
+    )
     rewritten = inject_smh_ui(rewritten)
 
     return Response(rewritten, mimetype="text/html",
@@ -1548,11 +1446,11 @@ def proxy(path):
     log.debug("Proxying: %s → %s", request.full_path, upstream)
 
     try:
-        resp = requests.get(upstream, headers=HEADERS, timeout=15, allow_redirects=True)
+        resp = SESSION.get(upstream, headers=HEADERS, timeout=15, allow_redirects=True)
         resp.raise_for_status()
     except requests.RequestException as e:
         log.exception("Failed to fetch upstream")
-        return f"<h1>Upstream fetch failed</h1><p>{e}</p>", 502
+        return f"<h1>Upstream fetch failed</h1><p>{escape(e)}</p>", 502
 
     content_type = resp.headers.get("Content-Type", "")
 
@@ -1574,23 +1472,22 @@ def proxy(path):
         body_html = strip_promos(body_html)
         overview = ""
         if article.get("overview"):
-            overview = f'<div class="overview">{article["overview"]}</div>'
+            overview = f'<div class="overview">{escape(article["overview"])}</div>'
         date = (article.get("date") or "")[:10]
 
         rendered = ARTICLE_TEMPLATE.format(
-            title=article["headline"],
+            title=escape(article["headline"]),
             overview=overview,
-            byline=article.get("byline", ""),
-            date=date,
+            byline=escape(article.get("byline", "")),
+            date=escape(date),
             body=body_html,
-            url=upstream,
+            url=escape(upstream),
             embed_script=EMBED_RESIZE_SCRIPT,
         )
         return Response(inject_smh_ui(rendered), mimetype="text/html")
 
-    # Not an article — proxy with link rewriting
-    rewritten = rewrite_html_links(html, upstream + "/")
-    rewritten = strip_page_chrome(rewritten)
+    # Not an article — proxy with link rewriting (single pass)
+    rewritten = process_html(html, upstream + "/", NINE_DOMAINS, "", BLOCK_PATTERNS)
 
     # Inject a working "Show more" button on section/index/topic pages
     req_path = "/" + path if path else "/"
@@ -1607,4 +1504,9 @@ def proxy(path):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5008, debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=5008,
+        debug=os.environ.get("SMH_DEBUG") == "1",
+        use_reloader=os.environ.get("SMH_DEBUG") == "1",
+    )
