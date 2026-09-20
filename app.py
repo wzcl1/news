@@ -320,9 +320,8 @@ def process_html(html, base_url, domains, prefix, block_patterns,
 APOLLO_SCRIPT_RE = re.compile(r"<script[^>]*>(.*?)</script>", re.DOTALL | re.I)
 
 
-def extract_article_data(html):
-    """Extract article body from embedded APOLLO_STATE JSON."""
-    hydration_data = None
+def _extract_apollo_state(html):
+    """Parse ``window.APOLLO_STATE = {...}`` from a page's inline scripts."""
     for m in APOLLO_SCRIPT_RE.finditer(html):
         text = m.group(1)
         marker = "window.APOLLO_STATE"
@@ -336,10 +335,16 @@ def extract_article_data(html):
         if start == -1:
             continue
         try:
-            hydration_data, _ = json.JSONDecoder().raw_decode(text[start:])
+            data, _ = json.JSONDecoder().raw_decode(text[start:])
+            return data
         except json.JSONDecodeError:
-            pass
-        break
+            return None
+    return None
+
+
+def extract_article_data(html):
+    """Extract article body from embedded APOLLO_STATE JSON."""
+    hydration_data = _extract_apollo_state(html)
 
     if not hydration_data:
         return None
@@ -375,6 +380,161 @@ def extract_article_data(html):
                         "asset_urls": asset_urls,
                     }
     return None
+
+
+def _state_asset_urls(hydration_data):
+    """Build a publicId -> canonical path map for all assets in the state."""
+    asset_urls = {}
+    for value in hydration_data.values():
+        if not isinstance(value, dict):
+            continue
+        public_id = value.get("publicId")
+        path = _get_nested(value, "urls", "canonical", "path")
+        if public_id and path:
+            asset_urls[public_id] = path
+    return asset_urls
+
+
+def extract_live_article_data(html):
+    """Extract a live blog (LiveArticleAsset + its Posts) from APOLLO_STATE.
+
+    Live blogs have no article ``body``; the content is a stream of ``Post``
+    objects (each with its own headline, timestamp and blocks). Posts are
+    returned newest-first, matching how SMH presents a live feed.
+    """
+    hydration_data = _extract_apollo_state(html)
+    if not hydration_data:
+        return None
+
+    live = None
+    for value in hydration_data.values():
+        if isinstance(value, dict) and value.get("__typename") == "LiveArticleAsset":
+            live = value
+            break
+    if live is None:
+        return None
+
+    asset_urls = _state_asset_urls(hydration_data)
+
+    posts = []
+    seen = set()
+    for value in hydration_data.values():
+        if not isinstance(value, dict) or value.get("__typename") != "Post":
+            continue
+        pid = value.get("publicId") or value.get("id")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        body = value.get("body")
+        blocks = body.get("blocks") if isinstance(body, dict) else None
+        posts.append({
+            "id": pid,
+            "headline": _get_nested(value, "headlines", "headline") or "",
+            "published": (_get_nested(value, "dates", "published")
+                          or _get_nested(value, "dates", "firstPublished") or ""),
+            "byline": _get_byline(value, hydration_data),
+            "blocks": blocks if isinstance(blocks, list) else [],
+        })
+
+    posts.sort(key=lambda p: p["published"], reverse=True)
+
+    return {
+        "headline": _get_nested(live, "headlines", "headline") or "",
+        "overview": (_get_nested(live, "overview", "about")
+                     or _get_nested(live, "overview", "intro") or ""),
+        "byline": _get_byline(live, hydration_data),
+        "date": (_get_nested(live, "dates", "published")
+                 or _get_nested(live, "dates", "firstPublished") or ""),
+        "asset_urls": asset_urls,
+        "posts": posts,
+    }
+
+
+LIVE_FEED_STYLE = """<style>
+  #__live_posts { max-width: 720px; }
+  .live-post { border-top: 1px solid #e5e5e5; padding: 1.25rem 0; }
+  .live-post:first-child { border-top: 0; }
+  .live-post-meta { font-size: .8rem; color: #777; margin-bottom: .35rem; }
+  .live-post-meta time { font-weight: 700; color: #c8102e;
+    text-transform: uppercase; letter-spacing: .03em; }
+  .live-post-title { margin: .1rem 0 .5rem; font-size: 1.15rem; line-height: 1.3; }
+  .live-post p { margin: .6rem 0; }
+  .tweet { border-left: 3px solid #1da1f2; padding-left: 1rem; }
+  .live-header { display: flex; align-items: center; gap: .6rem;
+    margin: 0 0 1rem; }
+  .live-badge { background: #c8102e; color: #fff; font-weight: 700;
+    font-size: .7rem; letter-spacing: .08em; padding: .15rem .5rem;
+    border-radius: 3px; }
+  #__live_updated { font-size: .8rem; color: #999; }
+</style>"""
+
+
+LIVE_FEED_SCRIPT = """<script>
+(function () {
+  var list = document.getElementById('__live_posts');
+  if (!list) return;
+  var fmt = function (root) {
+    root.querySelectorAll('time[data-date]').forEach(function (t) {
+      var d = new Date(t.getAttribute('data-date'));
+      if (isNaN(d.getTime())) return;
+      t.textContent = d.toLocaleString(undefined,
+        { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+    });
+  };
+  fmt(document);
+  var refresh = function () {
+    fetch(location.href, { headers: { 'X-Requested-With': 'fetch' } })
+      .then(function (r) { return r.text(); })
+      .then(function (txt) {
+        var doc = new DOMParser().parseFromString(txt, 'text/html');
+        var have = {};
+        list.querySelectorAll('.live-post[data-post-id]').forEach(function (e) {
+          have[e.getAttribute('data-post-id')] = 1;
+        });
+        var fresh = [];
+        doc.querySelectorAll('.live-post[data-post-id]').forEach(function (p) {
+          var id = p.getAttribute('data-post-id');
+          if (!have[id]) { have[id] = 1; fresh.push(p); }
+        });
+        if (fresh.length) {
+          fresh.reverse().forEach(function (p) {
+            var node = document.importNode(p, true);
+            fmt(node);
+            list.insertBefore(node, list.firstChild);
+          });
+          var b = document.getElementById('__live_updated');
+          if (b) b.textContent = 'Updated ' + new Date().toLocaleTimeString();
+        }
+      })
+      .catch(function () {});
+  };
+  setInterval(refresh, 30000);
+})();
+</script>"""
+
+
+def render_live_posts(posts, asset_urls=None):
+    """Render live-blog posts as a timeline (newest first)."""
+    parts = []
+    for post in posts:
+        body = blocks_to_html(post.get("blocks"), asset_urls)
+        headline = post.get("headline") or ""
+        head_html = (f'<h3 class="live-post-title">{escape(headline)}</h3>'
+                     if headline else "")
+        byline = post.get("byline") or ""
+        by = (f'<span class="live-post-byline"> {escape(byline)}</span>'
+              if byline else "")
+        published = post.get("published") or ""
+        parts.append(
+            f'<article class="live-post" data-post-id="{escape(post["id"])}" '
+            f'data-published="{escape(published)}">'
+            f'<div class="live-post-meta">'
+            f'<time class="live-time" datetime="{escape(published)}" '
+            f'data-date="{escape(published)}">{escape(published[:16])}</time>'
+            f'{by}</div>'
+            f'{head_html}{body}</article>'
+        )
+    return "\n".join(parts)
 
 
 def _get_nested(obj, *keys):
@@ -491,6 +651,20 @@ def blocks_to_html(blocks, asset_urls=None):
                     f'frameborder="0" title="Embedded chart" '
                     f'style="width:100%;border:0;min-height:420px"></iframe></div>'
                 )
+
+        elif btype == "TWITTER":
+            url = block.get("url", "")
+            if url:
+                parts.append(
+                    f'<blockquote class="tweet"><a href="{escape(url)}">'
+                    f'View post on X</a></blockquote>'
+                )
+
+        elif btype == "VIDEO":
+            provider = block.get("provider") or {}
+            vid = provider.get("id", "")
+            if vid:
+                parts.append(f'<p class="video-note">Video: {escape(vid)}</p>')
 
     return "\n".join(parts)
 
@@ -1109,7 +1283,11 @@ ARTICLE_TEMPLATE = """<!doctype html>
   <script>
   document.querySelectorAll('time[data-date]').forEach(function (t) {{
     var d = new Date(t.getAttribute('data-date'));
-    if (!isNaN(d.getTime())) {{
+    if (isNaN(d.getTime())) return;
+    if (t.classList.contains('live-time')) {{
+      t.textContent = d.toLocaleString(undefined,
+        {{ day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }});
+    }} else {{
       t.textContent = d.toLocaleDateString(undefined,
         {{ year: 'numeric', month: 'long', day: 'numeric' }});
     }}
@@ -1617,14 +1795,25 @@ def proxy(path):
 
     html = resp.text
 
-    # Try to extract clean article data
-    article = extract_article_data(html)
+    # Try to extract clean article data (regular article or live blog)
+    article = extract_article_data(html) or extract_live_article_data(html)
 
     if article and article.get("headline"):
-        log.debug("Clean article: %s (%d blocks)",
-                  article["headline"], len(article["blocks"]))
-        body_html = blocks_to_html(article["blocks"], article.get("asset_urls"))
-        body_html = strip_promos(body_html)
+        is_live = "posts" in article
+        if is_live:
+            log.debug("Clean live blog: %s (%d posts)",
+                      article["headline"], len(article["posts"]))
+            body_html = (LIVE_FEED_STYLE
+                         + '<div class="live-header"><span class="live-badge">LIVE</span>'
+                         + '<span id="__live_updated"></span></div>'
+                         + '<div id="__live_posts">'
+                         + render_live_posts(article["posts"], article.get("asset_urls"))
+                         + '</div>' + LIVE_FEED_SCRIPT)
+        else:
+            log.debug("Clean article: %s (%d blocks)",
+                      article["headline"], len(article["blocks"]))
+            body_html = blocks_to_html(article["blocks"], article.get("asset_urls"))
+            body_html = strip_promos(body_html)
         overview = ""
         if article.get("overview"):
             overview = f'<div class="overview">{escape(article["overview"])}</div>'
@@ -1642,7 +1831,9 @@ def proxy(path):
             url=escape(upstream),
             embed_script=EMBED_RESIZE_SCRIPT,
         )
-        return Response(inject_smh_ui(rendered), mimetype="text/html")
+        headers = {"Cache-Control": "no-store"} if is_live else {}
+        return Response(inject_smh_ui(rendered), mimetype="text/html",
+                        headers=headers)
 
     # Not an article — proxy with link rewriting (single pass)
     rewritten = process_html(html, upstream + "/", NINE_DOMAINS, "", BLOCK_PATTERNS)
