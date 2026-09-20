@@ -183,9 +183,12 @@ PARTNER_SELECTORS = [
     '[data-an-name*="from our partners" i]',
 ]
 
-# Non-article content strips (newsletter/podcast/weather "top stories" strap)
+# Non-article content units embedded in the top-stories region (newsletter
+# call-to-action, weather widget). NOTE: do not strip the parent
+# "top-stories-strap" — it wraps the news wells, "Just in" and editor's picks.
 STRIP_SELECTORS = [
-    '[data-testid="top-stories-strap"]',
+    '[data-testid="storysetcallstoaction-strap"]',
+    '[data-testid="weather-widget"]',
 ]
 
 SECTION_TITLES = {"explore", "shorts"}
