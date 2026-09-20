@@ -183,6 +183,11 @@ PARTNER_SELECTORS = [
     '[data-an-name*="from our partners" i]',
 ]
 
+# Non-article content strips (newsletter/podcast/weather "top stories" strap)
+STRIP_SELECTORS = [
+    '[data-testid="top-stories-strap"]',
+]
+
 SECTION_TITLES = {"explore", "shorts"}
 
 
@@ -267,9 +272,19 @@ def process_html(html, base_url, domains, prefix, block_patterns,
             tag.decompose()
 
     # Paywall / partner / ad element removal
-    for sel in PAYWALL_SELECTORS + PARTNER_SELECTORS + AD_SELECTORS:
+    for sel in PAYWALL_SELECTORS + PARTNER_SELECTORS + STRIP_SELECTORS + AD_SELECTORS:
         for el in soup.select(sel):
             el.decompose()
+
+    # Remove empty wrapper shells left behind after ad stripping
+    # (e.g. the header banner div that only contained an ad slot).
+    header = soup.find("header")
+    if header:
+        for div in header.find_all("div"):
+            if div.get_text(strip=True) or div.find(
+                    ["img", "iframe", "svg", "canvas", "video"]):
+                continue
+            div.decompose()
 
     for el in soup.find_all(True, class_=PAYWALL_CLASS_RE):
         el.decompose()
@@ -348,8 +363,10 @@ def extract_article_data(html):
                 if isinstance(blocks, list) and len(blocks) > 0:
                     return {
                         "headline": _get_nested(value, "headlines", "headline") or "",
-                        "overview": _get_nested(value, "overview", "about") or "",
-                        "byline": _get_byline(value),
+                        "overview": (_get_nested(value, "overview", "intro")
+                                     or _get_nested(value, "overview", "about")
+                                     or ""),
+                        "byline": _get_byline(value, hydration_data),
                         "date": _get_nested(value, "dates", "published") or "",
                         "blocks": blocks,
                         "asset_urls": asset_urls,
@@ -368,17 +385,21 @@ def _get_nested(obj, *keys):
     return None
 
 
-def _get_byline(obj):
+def _get_byline(obj, state=None):
     byline = obj.get("byline", [])
     if isinstance(byline, list) and byline:
         names = []
         for b in byline:
-            if isinstance(b, dict):
-                author = b.get("author", {})
-                if isinstance(author, dict):
-                    name = author.get("name", "")
-                    if name:
-                        names.append(name)
+            if not isinstance(b, dict):
+                continue
+            author = b.get("author")
+            if isinstance(author, dict):
+                ref = author.get("__ref")
+                if ref and isinstance(state, dict) and isinstance(state.get(ref), dict):
+                    author = state[ref]
+                name = author.get("name", "")
+                if name:
+                    names.append(name)
         return ", ".join(names)
     return ""
 
@@ -542,6 +563,29 @@ def extract_topic_meta(path, html):
     }
 
 
+def extract_afr_topic_meta(path, html):
+    """If the page is an AFR topic/tag page, return pagination metadata.
+
+    AFR topic pages are server-rendered (no INITIAL_STATE), so the already
+    shown asset IDs are recovered from the article hrefs, which end in
+    ``-<assetid>`` (e.g. ``...-p60ylb``).
+    """
+    m = TOPIC_RE.match(path)
+    if not m:
+        return None
+    tag_id = m.group(1)
+    # AFR canonical URLs end in ``-YYYYMMDD-p<assetid>``.
+    shown = list(dict.fromkeys(
+        re.findall(r"[0-9]{8}-p([0-9a-z]+)(?=[\"'?#]|$)", html)))
+    return {
+        "kind": "tag",
+        "tag_id": tag_id,
+        "path": path,
+        "brand": "afr",
+        "shown_ids": shown,
+    }
+
+
 GRAPHQL_HEADERS = {
     "Content-Type": "application/json",
     "User-Agent": HEADERS["User-Agent"],
@@ -550,12 +594,16 @@ GRAPHQL_HEADERS = {
 }
 
 
-def _graphql_post(query, variables):
+def _graphql_post(query, variables, url=None, origin=None):
     """POST a query to the FFX GraphQL API and return the data dict."""
+    headers = dict(GRAPHQL_HEADERS)
+    if origin:
+        headers["Origin"] = origin
+        headers["Referer"] = origin + "/"
     resp = SESSION.post(
-        GRAPHQL_URL,
+        url or GRAPHQL_URL,
         json={"query": query, "variables": variables},
-        headers=GRAPHQL_HEADERS,
+        headers=headers,
         timeout=15,
     )
     resp.raise_for_status()
@@ -599,7 +647,13 @@ def graphql_tag_more(tag_id, brand, since, count=12):
         + ASSET_FIELDS + "}}"
     )
     variables = {"brand": brand, "count": count, "tag": tag_id, "since": since}
-    return _graphql_post(query, variables)
+    if brand == "afr":
+        data = _graphql_post(query, variables,
+                             url=AFR_GRAPHQL_URL, origin=AFR_UPSTREAM)
+    else:
+        data = _graphql_post(query, variables)
+    conn = data.get("assetsConnection") or {}
+    return conn.get("assets", []), conn.get("pageInfo", {})
 
 
 MOST_POPULAR_FIELDS = (
@@ -621,12 +675,12 @@ def graphql_most_popular(brand, count=6):
 
 
 
-def render_more_cards(assets):
+def render_more_cards(assets, prefix=""):
     """Render GraphQL asset results as HTML cards."""
     cards = []
     for a in assets:
         aid = a.get("id", "")
-        path = _get_nested(a, "urls", "canonical", "path") or ""
+        path = prefix + (_get_nested(a, "urls", "canonical", "path") or "")
         headline = _get_nested(a, "asset", "headlines", "headline") or ""
         about = _get_nested(a, "asset", "about") or ""
         img_id = _get_nested(a, "featuredImages", "landscape16x9", "data", "id") or ""
@@ -661,6 +715,10 @@ SHOW_MORE_CSS = """
   .__smh_card_title a { color: #111; text-decoration: none; }
   .__smh_card_title a:hover { color: #c8102e; }
   .__smh_card_about { font-size: .9rem; color: #555; line-height: 1.4; margin: 0; }
+  @media (max-width: 767px) {
+    /* Match the native single-column mobile list layout. */
+    #__smh_more_container { grid-template-columns: 1fr; max-width: 720px; }
+  }
 </style>
 """
 
@@ -769,6 +827,12 @@ def inject_show_more(html, meta):
     i = low.find("<footer")
     if i != -1:
         candidates.append(i)
+    # AFR: place before the "AFR Magazine" pre-footer section.
+    i = low.find('data-testid="prefooter"')
+    if i != -1:
+        lt = low.rfind("<", 0, i)
+        if lt != -1:
+            candidates.append(lt)
     for pat in ('id="footer"', "id='footer'"):
         i = low.find(pat)
         if i != -1:
@@ -1033,12 +1097,21 @@ ARTICLE_TEMPLATE = """<!doctype html>
   <div class="nav"><a href="/">← Back to homepage</a></div>
   <h1>{title}</h1>
   {overview}
-  <div class="byline">{byline} &mdash; {date}</div>
+  <div class="byline">{byline}<time datetime="{date}" data-date="{date}">{date_short}</time></div>
   {body}
   <div class="footer">
     <p>Source: <a href="{url}">{url}</a></p>
   </div>
   {embed_script}
+  <script>
+  document.querySelectorAll('time[data-date]').forEach(function (t) {{
+    var d = new Date(t.getAttribute('data-date'));
+    if (!isNaN(d.getTime())) {{
+      t.textContent = d.toLocaleDateString(undefined,
+        {{ year: 'numeric', month: 'long', day: 'numeric' }});
+    }}
+  }});
+  </script>
 </body>
 </html>"""
 
@@ -1072,6 +1145,63 @@ def _afr_extract_hydration_data(html):
 
 
 _afr_story_cache = {}
+
+
+def strip_afr_header_cruft(html):
+    """Remove AFR homepage header cruft that the generic pass misses:
+    the 'Today's Paper' top bar, the empty market-snapshot loading bar and
+    empty styled-ad shells (their filling scripts are blocked)."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 'Today's Paper / Markets / Data / Events / Lists' top bar (desktop
+    # and mobile variants). CSS-module class names are build-hashed, so
+    # match on the stable suffixes.
+    targets = [el for el in soup.find_all("div")
+               if any(c.endswith(sfx) for c in (el.get("class") or [])
+                      for sfx in ("-headerTop", "-topHeader"))]
+    for el in targets:
+        if el.parent is not None:
+            el.decompose()
+
+    for el in soup.find_all(attrs={"data-testid": "market-snapshot-loading"}):
+        if not el.get_text(strip=True):
+            el.decompose()
+
+    for el in soup.find_all("div", class_=re.compile(r"styledAd")):
+        if el.get_text(strip=True) or el.find(["img", "iframe", "svg", "canvas"]):
+            continue
+        el.decompose()
+
+    # Sticky leaderboard ad placeholder.
+    for el in soup.find_all(id="stickyLeaderboard"):
+        el.decompose()
+
+    # Newsletter driver tiles (e.g. 'StoryTileDriverSmall') and any content
+    # unit left empty by their removal.
+    for el in soup.find_all(attrs={"data-testid": "StoryTileDriverSmall"}):
+        el.decompose()
+    for sec in soup.find_all("section", attrs={"data-contentunit-id": True}):
+        if sec.find_parent(attrs={"data-contentunit-id": True}):
+            continue
+        if not sec.get_text(strip=True) and not sec.find(
+                ["img", "iframe", "svg", "canvas", "video"]):
+            sec.decompose()
+
+    # Lazy-loaded images: the real URLs live in data-src/data-srcset and the
+    # swap-in script is blocked, so promote them to src/srcset.
+    for img in soup.find_all("img"):
+        if img.get("data-src"):
+            img["src"] = img["data-src"]
+            del img["data-src"]
+        if img.get("data-srcset"):
+            img["srcset"] = img["data-srcset"]
+            del img["data-srcset"]
+    for src_el in soup.find_all("source"):
+        if src_el.get("data-srcset"):
+            src_el["srcset"] = src_el["data-srcset"]
+            del src_el["data-srcset"]
+
+    return str(soup)
 
 
 def _afr_resolve_story(story_id):
@@ -1299,12 +1429,21 @@ AFR_ARTICLE_TEMPLATE = """<!doctype html>
   <h1>{title}</h1>
   {hero_img}
   {overview}
-  <div class="byline">{byline} &mdash; {date}</div>
+  <div class="byline">{byline}<time datetime="{date}" data-date="{date}">{date_short}</time></div>
   {body}
   <div class="footer">
     <p>Source: <a href="{url}">{url}</a></p>
   </div>
   {embed_script}
+  <script>
+  document.querySelectorAll('time[data-date]').forEach(function (t) {{
+    var d = new Date(t.getAttribute('data-date'));
+    if (!isNaN(d.getTime())) {{
+      t.textContent = d.toLocaleDateString(undefined,
+        {{ year: 'numeric', month: 'long', day: 'numeric' }});
+    }}
+  }});
+  </script>
 </body>
 </html>"""
 
@@ -1319,13 +1458,16 @@ def afr_build_article_html(article, upstream_url):
     if article.get("about"):
         overview = f'<div class="overview">{escape(article["about"])}</div>'
 
-    date = (article.get("date") or "")[:10]
+    date = (article.get("date") or "")
+    byline = article.get("byline", "")
+    byline_html = f"By {escape(byline)} &mdash; " if byline else ""
 
     return AFR_ARTICLE_TEMPLATE.format(
         title=escape(article.get("headline", "")),
         overview=overview,
-        byline=escape(article.get("byline", "")),
+        byline=byline_html,
         date=escape(date),
+        date_short=escape(date[:10]),
         body=strip_promos(article.get("body", "")),
         hero_img=hero_img,
         url=escape(upstream_url),
@@ -1376,6 +1518,15 @@ def afr_proxy(path):
         extra_id_re=ADSPOT_ID_RE,
         strip_state_scripts=True,
     )
+    rewritten = strip_afr_header_cruft(rewritten)
+
+    # Inject a working "Show more" button on topic pages
+    req_path = "/" + path if path else "/"
+    page_meta = extract_afr_topic_meta(req_path, html)
+    if page_meta:
+        log.debug("AFR pagination page %s — injecting show more", req_path)
+        rewritten = inject_show_more(rewritten, page_meta)
+
     rewritten = inject_smh_ui(rewritten)
 
     return Response(rewritten, mimetype="text/html",
@@ -1408,8 +1559,9 @@ def more():
         log.exception("GraphQL more request failed")
         return {"error": str(e)}, 502
 
+    prefix = "/afr" if brand == "afr" else ""
     return {
-        "html": render_more_cards(assets),
+        "html": render_more_cards(assets, prefix),
         "nextCursor": page_info.get("endCursor"),
         "hasNextPage": bool(page_info.get("hasNextPage")),
     }
@@ -1473,13 +1625,16 @@ def proxy(path):
         overview = ""
         if article.get("overview"):
             overview = f'<div class="overview">{escape(article["overview"])}</div>'
-        date = (article.get("date") or "")[:10]
+        date = (article.get("date") or "")
+        byline = article.get("byline", "")
+        byline_html = f"By {escape(byline)} &mdash; " if byline else ""
 
         rendered = ARTICLE_TEMPLATE.format(
             title=escape(article["headline"]),
             overview=overview,
-            byline=escape(article.get("byline", "")),
+            byline=byline_html,
             date=escape(date),
+            date_short=escape(date[:10]),
             body=body_html,
             url=escape(upstream),
             embed_script=EMBED_RESIZE_SCRIPT,
