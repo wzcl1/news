@@ -1046,7 +1046,16 @@ SMH_UI = """
   html.__smh_dark img, html.__smh_dark video,
   html.__smh_dark canvas, html.__smh_dark svg, html.__smh_dark iframe,
   html.__smh_dark embed, html.__smh_dark object,
-  html.__smh_dark #__smh_bar { filter: invert(1) hue-rotate(180deg); }
+  html.__smh_dark #__smh_bar, html.__smh_dark #__smh_ptr { filter: invert(1) hue-rotate(180deg); }
+  #__smh_ptr { position: fixed; top: 0; left: 0; right: 0; z-index: 2147483647;
+    display: flex; align-items: center; justify-content: center; gap: .45rem;
+    height: 56px; margin-top: -56px; background: #111; color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: .85rem; font-weight: 600; will-change: transform;
+    transition: transform .2s ease; }
+  #__smh_ptr.__smh_ptr_ready { background: #c8102e; }
+  #__smh_ptr.__smh_ptr_spin .__smh_ptr_icon { animation: __smh_spin .8s linear infinite; }
+  @keyframes __smh_spin { to { transform: rotate(360deg); } }
   .__smh_mv { display: grid; gap: 1rem; padding: 1rem;
     grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
   .__smh_mv .__smh_card { border-bottom: 1px solid rgba(128,128,128,.3);
@@ -1083,6 +1092,67 @@ SMH_UI = """
     apply(on);
     try { localStorage.setItem(KEY, on ? '1' : '0'); } catch (e) {}
   });
+})();
+</script>
+<div id="__smh_ptr" aria-hidden="true"><span class="__smh_ptr_icon">&#9660;</span><span class="__smh_ptr_text"></span></div>
+<script>
+(function () {
+  if (!('ontouchstart' in window) || window.__smh_ptr_init) return;
+  window.__smh_ptr_init = 1;
+  var bar = document.getElementById('__smh_ptr');
+  if (!bar) return;
+  var label = bar.querySelector('.__smh_ptr_text');
+  var THRESHOLD = 70, MAX = 110, REST = 56;
+  var startY = 0, dy = 0, pulling = false, active = false;
+  function render() {
+    var d = Math.max(0, Math.min(MAX, dy * 0.5));
+    bar.style.transform = 'translateY(' + d + 'px)';
+    var ready = dy >= THRESHOLD;
+    bar.classList.toggle('__smh_ptr_ready', ready);
+    if (label) label.textContent = ready ? 'Release to refresh' : 'Pull to refresh';
+  }
+  document.addEventListener('touchstart', function (e) {
+    if (e.touches.length !== 1 || window.pageYOffset > 0) { active = false; return; }
+    active = true; pulling = false; dy = 0; startY = e.touches[0].clientY;
+    bar.style.transition = 'none';
+  }, { passive: true });
+  document.addEventListener('touchmove', function (e) {
+    if (!active) return;
+    dy = e.touches[0].clientY - startY;
+    if (!pulling) {
+      if (dy > 8 && window.pageYOffset <= 0) {
+        pulling = true;
+      } else if (dy < -4) {
+        active = false; bar.style.transition = '';
+        return;
+      }
+    }
+    if (pulling) {
+      if (e.cancelable) e.preventDefault();
+      document.documentElement.style.overscrollBehaviorY = 'contain';
+      render();
+    }
+  }, { passive: false });
+  function end() {
+    if (!active) return;
+    active = false;
+    bar.style.transition = '';
+    document.documentElement.style.overscrollBehaviorY = '';
+    if (pulling && dy >= THRESHOLD) {
+      bar.classList.add('__smh_ptr_spin');
+      bar.style.transform = 'translateY(' + REST + 'px)';
+      bar.classList.add('__smh_ptr_ready');
+      if (label) label.textContent = 'Refreshing\u2026';
+      setTimeout(function () { location.reload(); }, 120);
+    } else {
+      bar.classList.remove('__smh_ptr_ready');
+      bar.style.transform = 'translateY(0)';
+      if (label) label.textContent = '';
+    }
+    pulling = false; dy = 0;
+  }
+  document.addEventListener('touchend', end, { passive: true });
+  document.addEventListener('touchcancel', end, { passive: true });
 })();
 </script>
 <script>
