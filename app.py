@@ -1646,6 +1646,112 @@ def afr_extract_article_data(html):
     return None
 
 
+def afr_extract_live_article_data(html):
+    """Extract a live blog from AFR's __staticRouterHydrationData.
+
+    AFR live articles have posts in ``content.asset.posts`` and optionally
+    ``content.asset.pinnedPosts``.  Each post has its own body, headline,
+    byline and dates.  Posts are returned newest-first.
+    """
+    data = _afr_extract_hydration_data(html)
+    if not data:
+        return None
+
+    loader = data.get("loaderData", {})
+    for key, val in loader.items():
+        content_data = val.get("content", {})
+        if not isinstance(content_data, dict):
+            continue
+
+        asset = content_data.get("asset", {})
+        if not isinstance(asset, dict):
+            continue
+
+        asset_type = asset.get("assetType", "")
+        is_live = asset.get("isLive", False)
+        if asset_type != "liveArticle" and not is_live:
+            continue
+
+        posts_raw = asset.get("posts") or []
+        pinned_raw = asset.get("pinnedPosts") or []
+
+        # Merge pinned + posts, dedup by id
+        seen = set()
+        posts = []
+        for p in pinned_raw + posts_raw:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            post_asset = p.get("asset") or {}
+            body = post_asset.get("body", "")
+            if body:
+                body = _afr_resolve_unicode_escapes(body)
+                placeholders = post_asset.get("bodyPlaceholders") or {}
+                body = _afr_resolve_placeholders(body, placeholders)
+                # Rewrite AFR links
+                def _rewrap(m):
+                    q, url = m.group(1), m.group(2)
+                    return f'href={q}{rewrite_url(url, "", AFR_DOMAINS, "/afr")}{q}'
+                body = re.sub(r'href=(["\'])(.*?)\1', _rewrap, body)
+            dates = p.get("dates") or {}
+            published = dates.get("published") or dates.get("firstPublished") or ""
+            post_headline = _get_nested(post_asset, "headlines", "headline") or ""
+            byline = post_asset.get("byline", "")
+            posts.append({
+                "id": pid,
+                "headline": post_headline,
+                "published": published,
+                "byline": byline,
+                "body": body,
+            })
+
+        # Sort newest first (same as SMH)
+        posts.sort(key=lambda p: p["published"], reverse=True)
+
+        if not posts:
+            continue
+
+        # Extract article-level metadata
+        headline = _get_nested(asset, "headlines", "headline") or ""
+        byline = asset.get("byline", "")
+        if isinstance(byline, list):
+            names = []
+            for b in byline:
+                if isinstance(b, dict):
+                    name = b.get("name", "")
+                    if name:
+                        names.append(name)
+            byline = ", ".join(names) if names else ""
+        about = asset.get("about", "")
+        dates = content_data.get("dates") or {}
+        published = dates.get("published") or dates.get("firstPublished") or ""
+        hero_img = ""
+        featured = content_data.get("featuredImages") or {}
+        if isinstance(featured, dict):
+            for ratio in ("landscape16x9", "landscape3x2", "square1x1"):
+                img_data = featured.get(ratio, {})
+                if isinstance(img_data, dict):
+                    file_name = img_data.get("data", {}).get("fileName", "")
+                    if file_name:
+                        hero_img = f"https://static.ffx.io/images/{file_name}"
+                        break
+
+        return {
+            "headline": headline,
+            "byline": byline,
+            "about": about,
+            "date": published,
+            "hero_img": hero_img,
+            "posts": posts,
+            "url": (content_data.get("urls") or {}).get("canonical", {}).get("path", ""),
+        }
+
+    return None
+
+
 AFR_ARTICLE_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
@@ -1694,6 +1800,105 @@ AFR_ARTICLE_TEMPLATE = """<!doctype html>
         {{ year: 'numeric', month: 'long', day: 'numeric' }});
     }}
   }});
+  </script>
+</body>
+</html>"""
+
+
+AFR_LIVE_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{title}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {{ font-family: Georgia, 'Times New Roman', serif;
+           max-width: 720px; margin: 2rem auto; padding: 0 1rem;
+           color: #1a1a1a; line-height: 1.7; font-size: 18px; }}
+    h1 {{ font-size: 2rem; margin-bottom: 0.5rem; line-height: 1.2; }}
+    .byline {{ color: #666; font-size: 0.9rem; margin-bottom: 1.5rem; }}
+    .overview {{ font-style: italic; color: #444; margin-bottom: 1.5rem;
+                border-left: 3px solid #0f6cc9; padding-left: 1rem; }}
+    img {{ max-width: 100%; height: auto; margin: 1rem 0; }}
+    .nav {{ margin-bottom: 2rem; font-size: 0.9rem; }}
+    .nav a {{ color: #666; text-decoration: none; }}
+    .nav a:hover {{ color: #0f6cc9; }}
+    .footer {{ margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #ddd;
+              font-size: 0.85rem; color: #999; }}
+    #__live_posts {{ max-width: 720px; }}
+    .live-post {{ border-top: 1px solid #e5e5e5; padding: 1.25rem 0; }}
+    .live-post:first-child {{ border-top: 0; }}
+    .live-post-meta {{ font-size: .8rem; color: #777; margin-bottom: .35rem; }}
+    .live-post-meta time {{ font-weight: 700; color: #c8102e;
+      text-transform: uppercase; letter-spacing: .03em; }}
+    .live-post-title {{ margin: .1rem 0 .5rem; font-size: 1.15rem; line-height: 1.3; }}
+    .live-post p {{ margin: .6rem 0; }}
+    .live-header {{ display: flex; align-items: center; gap: .6rem;
+      margin: 0 0 1rem; }}
+    .live-badge {{ background: #c8102e; color: #fff; font-weight: 700;
+      font-size: .7rem; letter-spacing: .08em; padding: .15rem .5rem;
+      border-radius: 3px; }}
+    #__live_updated {{ font-size: .8rem; color: #999; }}
+  </style>
+</head>
+<body>
+  <div class="nav"><a href="/afr">← Back to AFR homepage</a></div>
+  <h1>{title}</h1>
+  {hero_img}
+  {overview}
+  <div class="byline">{byline}<time datetime="{date}" data-date="{date}">{date_short}</time></div>
+  <div class="live-header"><span class="live-badge">LIVE</span>
+    <span id="__live_updated"></span></div>
+  <div id="__live_posts">{posts}</div>
+  <div class="footer">
+    <p>Source: <a href="{url}">{url}</a></p>
+  </div>
+  {focus_script}
+  <script>
+  document.querySelectorAll('time[data-date]').forEach(function (t) {{
+    var d = new Date(t.getAttribute('data-date'));
+    if (!isNaN(d.getTime())) {{
+      t.textContent = d.toLocaleString(undefined,
+        {{ day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }});
+    }}
+  }});
+  (function () {{
+    var list = document.getElementById('__live_posts');
+    if (!list) return;
+    var refresh = function () {{
+      fetch(location.href, {{ headers: {{ 'X-Requested-With': 'fetch' }} }})
+        .then(function (r) {{ return r.text(); }})
+        .then(function (txt) {{
+          var doc = new DOMParser().parseFromString(txt, 'text/html');
+          var have = {{}};
+          list.querySelectorAll('.live-post[data-post-id]').forEach(function (e) {{
+            have[e.getAttribute('data-post-id')] = 1;
+          }});
+          var fresh = [];
+          doc.querySelectorAll('.live-post[data-post-id]').forEach(function (p) {{
+            var id = p.getAttribute('data-post-id');
+            if (!have[id]) {{ have[id] = 1; fresh.push(p); }}
+          }});
+          if (fresh.length) {{
+            fresh.reverse().forEach(function (p) {{
+              var node = document.importNode(p, true);
+              node.querySelectorAll('time[data-date]').forEach(function (t) {{
+                var d = new Date(t.getAttribute('data-date'));
+                if (!isNaN(d.getTime())) {{
+                  t.textContent = d.toLocaleString(undefined,
+                    {{ day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }});
+                }}
+              }});
+              list.insertBefore(node, list.firstChild);
+            }});
+            var b = document.getElementById('__live_updated');
+            if (b) b.textContent = 'Updated ' + new Date().toLocaleTimeString();
+          }}
+        }})
+        .catch(function () {{}});
+    }};
+    setInterval(refresh, 30000);
+  }})();
   </script>
 </body>
 </html>"""
@@ -1761,6 +1966,74 @@ def afr_proxy(path):
         log.debug("AFR Clean article: %s", article["headline"])
         rendered = afr_build_article_html(article, upstream)
         return Response(inject_smh_ui(rendered), mimetype="text/html")
+
+    # Try to extract live blog data
+    live = afr_extract_live_article_data(html)
+
+    if live and live.get("headline"):
+        log.debug("AFR Live blog: %s (%d posts)",
+                  live["headline"], len(live["posts"]))
+        # Determine which post to scroll to
+        focus_post = request.args.get("post", "")
+
+        # Render posts as HTML
+        live_posts_html = []
+        for post in live["posts"]:
+            post_id = post["id"]
+            anchor = f' id="post-{escape(post_id)}"' if post_id else ""
+            body = strip_promos(post.get("body", ""))
+            headline = post.get("headline") or ""
+            head_html = (f'<h3 class="live-post-title">{escape(headline)}</h3>'
+                         if headline else "")
+            byline = post.get("byline") or ""
+            by = (f'<span class="live-post-byline"> {escape(byline)}</span>'
+                  if byline else "")
+            published = post.get("published") or ""
+            live_posts_html.append(
+                f'<article class="live-post" data-post-id="{escape(post_id)}" '
+                f'data-published="{escape(published)}"{anchor}>'
+                f'<div class="live-post-meta">'
+                f'<time class="live-time" datetime="{escape(published)}" '
+                f'data-date="{escape(published)}">{escape(published[:16])}</time>'
+                f'{by}</div>'
+                f'{head_html}{body}</article>'
+            )
+        posts_html = "\n".join(live_posts_html)
+
+        hero_img = ""
+        if live.get("hero_img"):
+            hero_img = f'<img src="{live["hero_img"]}" alt="" style="max-width:100%;height:auto;margin-bottom:1.5rem;">'
+        overview = ""
+        if live.get("about"):
+            overview = f'<div class="overview">{escape(live["about"])}</div>'
+        date = live.get("date") or ""
+        byline = live.get("byline", "")
+        byline_html = f"By {escape(byline)} &mdash; " if byline else ""
+
+        # Focus script: scroll to the ?post= anchor
+        focus_script = ""
+        if focus_post:
+            safe_id = escape(focus_post)
+            focus_script = (
+                '<script>'
+                f'var el=document.getElementById("post-{safe_id}");'
+                'if(el)el.scrollIntoView({behavior:"smooth",block:"start"});'
+                '</script>'
+            )
+
+        rendered = AFR_LIVE_TEMPLATE.format(
+            title=escape(live.get("headline", "")),
+            overview=overview,
+            byline=byline_html,
+            date=escape(date),
+            date_short=escape(date[:10]),
+            hero_img=hero_img,
+            url=escape(upstream),
+            posts=posts_html,
+            focus_script=focus_script,
+        )
+        return Response(inject_smh_ui(rendered), mimetype="text/html",
+                        headers={"Cache-Control": "no-store"})
 
     # Not an article — proxy with link rewriting (single pass)
     rewritten = process_html(
