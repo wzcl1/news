@@ -1074,8 +1074,10 @@ def _resolve_placeholders(markup, placeholders, asset_urls=None):
             if any(host.endswith(d) for d in SMH_DOMAINS):
                 url = parsed.path
         if url and text:
-            return f'<a href="{escape(url)}">{escape(text)}</a>'
-        return escape(text)
+            # `text` is stored as HTML by the CMS (e.g. <b>site.com</b>), so
+            # escaping it printed the tags literally.
+            return f'<a href="{escape(url)}">{text}</a>'
+        return text
 
     markup = re.sub(r"<x-placeholder[^>]*>.*?</x-placeholder>", replacer, markup, flags=re.DOTALL)
     markup = re.sub(r"<x-placeholder[^>]*/?>", replacer, markup)
@@ -2031,8 +2033,9 @@ def _afr_resolve_placeholders(body, placeholders):
             new_tab = data.get("newTab", False)
             target = ' target="_blank" rel="noopener"' if new_tab else ""
             if url and text:
-                return f'<a href="{escape(url)}"{target}>{escape(text)}</a>'
-            return escape(text)
+                # `text` is stored as HTML by the CMS, same as the SMH side.
+                return f'<a href="{escape(url)}"{target}>{text}</a>'
+            return text
 
         elif ptype == "relatedStory":
             story_id = data.get("id", "")
