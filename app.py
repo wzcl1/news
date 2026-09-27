@@ -12,6 +12,8 @@ import os
 import re
 import json
 import logging
+import time
+from collections import OrderedDict
 from urllib.parse import urljoin, urlparse
 from flask import Flask, request, Response
 import requests
@@ -26,6 +28,110 @@ app = Flask(__name__)
 SESSION = requests.Session()
 
 UPSTREAM = "https://www.smh.com.au"
+
+# ── Page cache: serve rendered pages from memory for 5 minutes ────────
+# Clean article renders and index/section pages are cached. Live blogs never
+# are — their content changes minute to minute.
+PAGE_CACHE_TTL = 300  # seconds
+PAGE_CACHE_MAX_ENTRIES = 200
+PAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024
+# Index pages are identical server-side for PAGE_CACHE_TTL seconds, so let the
+# browser reuse them for a slice of that. They used to be sent `no-store`,
+# which forced a full round trip on every repeat visit.
+INDEX_CACHE_HEADER = {"Cache-Control": "public, max-age=60"}
+# Insertion order doubles as LRU order: hits are moved to the end and the
+# oldest entry is evicted first.
+# entry -> (monotonic_ts, body, mimetype, headers, status)
+_page_cache = OrderedDict()
+
+
+def _page_cache_get(key):
+    entry = _page_cache.get(key)
+    if entry is None:
+        return None
+    ts, body, mimetype, headers, status = entry
+    if time.monotonic() - ts > PAGE_CACHE_TTL:
+        # Only drop the entry we actually read: another thread may have
+        # already replaced it with a fresh one, and a bare `del` would raise
+        # KeyError (a 500) on that race.
+        if _page_cache.get(key) is entry:
+            _page_cache.pop(key, None)
+        return None
+    _page_cache.move_to_end(key)
+    return body, mimetype, headers, status
+
+
+def _page_cache_set(key, body, mimetype, headers, status):
+    """Store a rendered page."""
+    _page_cache[key] = (time.monotonic(), body, mimetype, headers, status)
+    _page_cache.move_to_end(key)
+    while len(_page_cache) > PAGE_CACHE_MAX_ENTRIES:
+        _page_cache.popitem(last=False)
+    while len(_page_cache) > 1 and sum(
+            len(e[1])
+            for e in _page_cache.values()) > PAGE_CACHE_MAX_BYTES:
+        _page_cache.popitem(last=False)
+
+
+def _cached_response(key):
+    """Serve this request's cached render. None on a miss."""
+    cached = _page_cache_get(key)
+    if not cached:
+        return None
+    body, mimetype, headers, status = cached
+    return Response(body, mimetype=mimetype, headers=headers, status=status)
+
+
+# Query parameters that name a campaign or tracker rather than content. They
+# are dropped from the cache key so that ?utm_source=... cannot fragment it.
+_TRACKING_PARAM_RE = re.compile(
+    r"^utm_|^(gclid|gbraid|wbraid|fbclid|igshid|msclkid|yclid|twclid|"
+    r"li_fat_id|mc_cid|mc_eid|_ga|ref_src|ref_url|cmpid)$",
+    re.I,
+)
+
+
+def _page_cache_key(brand):
+    """Cache key for the current request: brand + path + normalised query.
+
+    Query values are decoded defensively because Werkzeug's
+    ``request.full_path`` raises UnicodeDecodeError on non-UTF-8 bytes.
+    Remaining parameters are sorted, so ordering cannot create duplicates.
+    """
+    parts = []
+    for part in request.query_string.decode("utf-8", "replace").split("&"):
+        name = part.split("=", 1)[0]
+        if part and not _TRACKING_PARAM_RE.match(name):
+            parts.append(part)
+    key = f"{brand}:{request.path}"
+    if parts:
+        key += "?" + "&".join(sorted(parts))
+    return key
+
+
+def _upstream_url(base, path):
+    """Upstream URL for the current request's path and query string."""
+    if request.query_string:
+        # Never raise on malformed (non-UTF-8) query bytes.
+        return f"{base}/{path}?{request.query_string.decode('utf-8', 'replace')}"
+    return f"{base}/{path}" if path else base
+
+
+def _upstream_error_response(resp, upstream):
+    """Report an upstream 4xx/5xx with its real status code.
+
+    Previously ``raise_for_status()`` turned every upstream 404 into a 502
+    "Upstream fetch failed", which hides the actual outcome.
+    """
+    log.warning("Upstream returned %s %s for %s",
+                resp.status_code, resp.reason or "", upstream)
+    body = (
+        f"<h1>{resp.status_code} {escape(resp.reason or '')}</h1>"
+        f"<p>The upstream server returned {resp.status_code} for "
+        f'<a href="{escape(upstream)}">{escape(upstream)}</a>.</p>'
+    )
+    return Response(body, mimetype="text/html", status=resp.status_code,
+                    headers={"Cache-Control": "no-store"})
 
 GRAPHQL_URL = "https://api.ffx.io/graphql"
 NAV_ASSET_TYPES = [
@@ -45,18 +151,12 @@ HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
-NINE_DOMAINS = [
-    "smh.com.au",
-    "theage.com.au",
-    "brisbanetimes.com.au",
-    "watoday.com.au",
-]
-
-# Paths/extensions to skip proxying (serve as pass-through)
-SKIP_EXTENSIONS = {
-    ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-    ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".webp",
-}
+# Hosts each proxy route can actually fetch. A route only has one upstream, so
+# only its own brand may be rewritten onto that route's prefix — rewriting a
+# link to another masthead onto it would fetch the wrong origin (e.g. an AFR
+# page linking to smh.com.au would ask afr.com for that path). Cross-brand
+# links are therefore left absolute and resolved by the browser.
+SMH_DOMAINS = ["smh.com.au"]
 
 # Paywall-related URL patterns to block (compiled)
 BLOCK_PATTERNS = [
@@ -76,12 +176,9 @@ AFR_UPSTREAM = "https://www.afr.com"
 
 AFR_GRAPHQL_URL = "https://api.afr.com/graphql"
 
+# Hosts the AFR route (prefix "/afr") can fetch — see SMH_DOMAINS.
 AFR_DOMAINS = [
     "afr.com",
-    "theage.com.au",
-    "smh.com.au",
-    "brisbanetimes.com.au",
-    "watoday.com.au",
 ]
 
 # Superset of BLOCK_PATTERNS plus AFR-specific trackers (compiled).
@@ -116,10 +213,18 @@ def rewrite_url(url, base_url, domains, prefix=""):
     """Convert a URL to route through the proxy. Returns rewritten URL string.
 
     ``prefix`` is "" for the SMH proxy (served at /) and "/afr" for the
-    AFR proxy.
+    AFR proxy. ``domains`` lists the hosts this route can fetch, so only
+    those are mapped onto the prefix; anything else is left alone.
     """
     if not url or url.startswith(("#", "javascript:", "mailto:", "tel:")):
         return url
+
+    # Protocol-relative ("//host/path"): normalise to absolute so the host is
+    # tested below. Handled as root-relative it would swallow the host into
+    # the proxy path ("/afr/api.ffx.io/...") or, for SMH, send the browser
+    # straight to the origin outside the proxy.
+    if url.startswith("//"):
+        url = f"{urlparse(base_url).scheme or 'https'}:{url}"
 
     # Root-relative URL
     if url.startswith("/"):
@@ -127,12 +232,6 @@ def rewrite_url(url, base_url, domains, prefix=""):
             # SMH: already proxy-relative
             return url
         if url == prefix or url.startswith(prefix + "/"):
-            return url
-        if url.startswith(("/assets/", "/fonts/", "/favicon", "/apple-touch-icon", "/manifest")):
-            return url
-        last = url.rsplit("/", 1)[-1]
-        ext = "." + last.rsplit(".", 1)[-1].lower() if "." in last else ""
-        if ext in SKIP_EXTENSIONS:
             return url
         if "?" in url:
             path, qs = url.lstrip("/").split("?", 1)
@@ -145,9 +244,10 @@ def rewrite_url(url, base_url, domains, prefix=""):
         host = parsed.hostname or ""
         if any(host.endswith(d) for d in domains):
             path = parsed.path.lstrip("/")
+            frag = f"#{parsed.fragment}" if parsed.fragment else ""
             if parsed.query:
-                return f"{prefix}/{path}?{parsed.query}"
-            return f"{prefix}/{path}"
+                return f"{prefix}/{path}?{parsed.query}{frag}"
+            return f"{prefix}/{path}{frag}"
         # External link — leave as-is
         return url
 
@@ -156,10 +256,12 @@ def rewrite_url(url, base_url, domains, prefix=""):
     parsed = urlparse(resolved)
     host = parsed.hostname or ""
     if any(host.endswith(d) for d in domains):
-        return rewrite_url(
-            parsed.path + (f"?{parsed.query}" if parsed.query else ""),
-            base_url, domains, prefix,
-        )
+        tail = parsed.path
+        if parsed.query:
+            tail += f"?{parsed.query}"
+        if parsed.fragment:
+            tail += f"#{parsed.fragment}"
+        return rewrite_url(tail, base_url, domains, prefix)
 
     return url
 
@@ -205,7 +307,8 @@ def _strip_named_sections(soup):
 
 def _strip_footer_below_socials(soup):
     """Remove footer content that sits below the social media links."""
-    footers = soup.find_all("footer") + soup.select('#footer, [data-testid="footer"]')
+    footers = soup.find_all("footer") + soup.select(
+        '#footer, [data-testid="footer"]')
     seen = set()
     for footer in footers:
         if id(footer) in seen:
@@ -243,7 +346,22 @@ PAYWALL_CLASS_RE = re.compile(r"paywall|subscribe-prompt|regwall|gateway|meter-w
 PAYWALL_ID_RE = re.compile(r"piano|tp-|tif-wrapper", re.I)
 ADSPOT_ID_RE = re.compile(r"adspot|ad-slot|consent|cookie", re.I)
 
-STATE_SCRIPT_MARKERS = ("__redux_state__", "__apollo_state__", "__staticrouterydrationdata")
+# Markers identifying a framework hydration payload rather than a paywall or
+# tracker script. Matched against the lowercased inline script body:
+#   window.INITIAL_STATE            — SMH index/section/article hydration
+#   window.APOLLO_STATE             — SMH article hydration (what the
+#                                     article extractor actually looks for)
+#   __staticRouterHydrationData     — AFR
+#   __redux_state__/__apollo_state__ — AFR's state blobs
+# The previous list spelled ``__staticRouterHydrationData`` as
+# ``__staticrouterydrationdata`` — missing the "h" — so it never matched.
+STATE_SCRIPT_MARKERS = (
+    "__redux_state__",
+    "__apollo_state__",
+    "__staticrouterhydrationdata",
+    "window.initial_state",
+    "window.apollo_state",
+)
 
 
 def process_html(html, base_url, domains, prefix, block_patterns,
@@ -261,12 +379,22 @@ def process_html(html, base_url, domains, prefix, block_patterns,
     # Paywall/tracking script removal
     for tag in soup.find_all("script"):
         src = (tag.get("src") or "").lower()
-        body = (tag.string or "").lower()
-        blob = src + " " + body
-        if any(p.search(blob) for p in block_patterns):
+        if any(p.search(src) for p in block_patterns):
             tag.decompose()
             continue
-        if strip_state_scripts and any(m in blob for m in STATE_SCRIPT_MARKERS):
+        body = tag.string or ""
+        if not body:
+            continue
+        low = body.lower()
+        if any(m in low for m in STATE_SCRIPT_MARKERS):
+            # Hydration payload: keep it unless the caller asked for state to
+            # be stripped. It is article/state data, so it routinely contains
+            # words like "paywall"/"subscribe" — keyword-matching it deleted
+            # SMH's entire INITIAL_STATE bundle (and its bootstrap code).
+            if strip_state_scripts:
+                tag.decompose()
+            continue
+        if any(p.search(low) for p in block_patterns):
             tag.decompose()
 
     for tag in soup.find_all("link"):
@@ -275,8 +403,8 @@ def process_html(html, base_url, domains, prefix, block_patterns,
             tag.decompose()
 
     # Paywall / partner / ad element removal
-    for sel in PAYWALL_SELECTORS + PARTNER_SELECTORS + STRIP_SELECTORS + AD_SELECTORS:
-        for el in soup.select(sel):
+    for selector in PAYWALL_SELECTORS + AD_SELECTORS + PARTNER_SELECTORS + STRIP_SELECTORS:
+        for el in soup.select(selector):
             el.decompose()
 
     # Remove empty wrapper shells left behind after ad stripping
@@ -319,13 +447,15 @@ def process_html(html, base_url, domains, prefix, block_patterns,
 
 APOLLO_SCRIPT_RE = re.compile(r"<script[^>]*>(.*?)</script>", re.DOTALL | re.I)
 
+# Distinguishes "no pre-parsed state passed in" from "state parsed to None".
+_STATE_UNSET = object()
+
 
 def _extract_apollo_state(html):
     """Parse ``window.APOLLO_STATE = {...}`` from a page's inline scripts."""
     for m in APOLLO_SCRIPT_RE.finditer(html):
         text = m.group(1)
-        marker = "window.APOLLO_STATE"
-        idx = text.find(marker)
+        idx = text.find("window.APOLLO_STATE")
         if idx == -1:
             continue
         eq = text.find("=", idx)
@@ -342,9 +472,14 @@ def _extract_apollo_state(html):
     return None
 
 
-def extract_article_data(html):
-    """Extract article body from embedded APOLLO_STATE JSON."""
-    hydration_data = _extract_apollo_state(html)
+def extract_article_data(html, hydration_data=_STATE_UNSET):
+    """Extract article body from embedded APOLLO_STATE JSON.
+
+    Pass ``hydration_data`` when the state has already been parsed, so a
+    single request does not decode the same multi-megabyte blob twice.
+    """
+    if hydration_data is _STATE_UNSET:
+        hydration_data = _extract_apollo_state(html)
 
     if not hydration_data:
         return None
@@ -395,14 +530,18 @@ def _state_asset_urls(hydration_data):
     return asset_urls
 
 
-def extract_live_article_data(html):
+def extract_live_article_data(html, hydration_data=_STATE_UNSET):
     """Extract a live blog (LiveArticleAsset + its Posts) from APOLLO_STATE.
 
     Live blogs have no article ``body``; the content is a stream of ``Post``
     objects (each with its own headline, timestamp and blocks). Posts are
     returned newest-first, matching how SMH presents a live feed.
+
+    Pass ``hydration_data`` when the state has already been parsed (see
+    :func:`extract_article_data`).
     """
-    hydration_data = _extract_apollo_state(html)
+    if hydration_data is _STATE_UNSET:
+        hydration_data = _extract_apollo_state(html)
     if not hydration_data:
         return None
 
@@ -597,7 +736,7 @@ def _resolve_placeholders(markup, placeholders, asset_urls=None):
             # Convert absolute Nine URLs to proxy-relative paths
             parsed = urlparse(url)
             host = parsed.hostname or ""
-            if any(host.endswith(d) for d in NINE_DOMAINS):
+            if any(host.endswith(d) for d in SMH_DOMAINS):
                 url = parsed.path
         if url and text:
             return f'<a href="{escape(url)}">{escape(text)}</a>'
@@ -647,7 +786,7 @@ def blocks_to_html(blocks, asset_urls=None):
             url = block.get("url", "")
             if url:
                 parts.append(
-                    f'<div class="embed"><iframe src="{url}" scrolling="no" '
+                    f'<div class="embed"><iframe src="{escape(url)}" scrolling="no" '
                     f'frameborder="0" title="Embedded chart" '
                     f'style="width:100%;border:0;min-height:420px"></iframe></div>'
                 )
@@ -670,17 +809,14 @@ def blocks_to_html(blocks, asset_urls=None):
 
 
 def _parse_initial_state(html):
-    """Parse window.INITIAL_STATE = JSON.parse("...") from the page."""
+    """Parse ``window.INITIAL_STATE = JSON.parse("...")`` from the page."""
     m = re.search(
         r'window\.INITIAL_STATE\s*=\s*JSON\.parse\("((?:[^"\\]|\\.)*)"\)',
-        html,
-        re.DOTALL,
-    )
+        html, re.DOTALL)
     if not m:
         return None
     try:
-        inner = json.loads('"' + m.group(1) + '"')
-        return json.loads(inner)
+        return json.loads(json.loads('"' + m.group(1) + '"'))
     except (json.JSONDecodeError, ValueError):
         return None
 
@@ -1377,25 +1513,25 @@ def _afr_extract_hydration_data(html):
     if idx == -1:
         return None
 
-    json_start = idx + len(marker)
-    # Find the closing quote for the JSON.parse argument
-    i = json_start
-    while i < len(html):
-        if html[i] == '"' and html[i - 1] != '\\':
-            break
-        i += 1
-    json_str = html[json_start:i]
+    # Position of the opening quote of the JSON.parse string literal.
+    quote_at = idx + len(marker) - 1
+    if quote_at < 0 or quote_at >= len(html):
+        return None
 
     try:
-        # Unescape the JSON string (it's double-escaped)
-        unescaped = json.loads('"' + json_str + '"')
-        data = json.loads(unescaped)
-        return data
-    except (json.JSONDecodeError, ValueError):
+        # raw_decode parses the JSON string literal in C, handling escapes
+        # correctly. Scanning for the closing quote by hand was both slow
+        # (a Python-level pass over a megabyte of HTML) and wrong for the
+        # `\\"` sequence, which would run past the real terminator.
+        encoded, _ = json.JSONDecoder().raw_decode(html, quote_at)
+        return json.loads(encoded)
+    except (json.JSONDecodeError, ValueError, IndexError):
         return None
 
 
-_afr_story_cache = {}
+# LRU cache of resolved AFR story ids (key order = least to most recent).
+AFR_STORY_CACHE_MAX = 1000
+_afr_story_cache = OrderedDict()
 
 
 def strip_afr_header_cruft(html):
@@ -1458,6 +1594,7 @@ def strip_afr_header_cruft(html):
 def _afr_resolve_story(story_id):
     """Resolve an AFR story ID to (canonical_path, headline) via GraphQL. Cached."""
     if story_id in _afr_story_cache:
+        _afr_story_cache.move_to_end(story_id)
         return _afr_story_cache[story_id]
 
     result = (None, None)
@@ -1484,9 +1621,9 @@ def _afr_resolve_story(story_id):
     except (requests.RequestException, json.JSONDecodeError, ValueError):
         log.warning("AFR: Failed to resolve story id %s", story_id)
 
-    if len(_afr_story_cache) > 1000:
-        _afr_story_cache.clear()
     _afr_story_cache[story_id] = result
+    while len(_afr_story_cache) > AFR_STORY_CACHE_MAX:
+        _afr_story_cache.popitem(last=False)
     return result
 
 
@@ -1565,9 +1702,14 @@ def _afr_resolve_unicode_escapes(text):
     )
 
 
-def afr_extract_article_data(html):
-    """Extract article data from AFR's __staticRouterHydrationData."""
-    data = _afr_extract_hydration_data(html)
+def afr_extract_article_data(html, data=_STATE_UNSET):
+    """Extract article data from AFR's __staticRouterHydrationData.
+
+    Pass ``data`` when the payload has already been parsed, so a request
+    does not scan and decode the same blob twice.
+    """
+    if data is _STATE_UNSET:
+        data = _afr_extract_hydration_data(html)
     if not data:
         return None
 
@@ -1646,14 +1788,18 @@ def afr_extract_article_data(html):
     return None
 
 
-def afr_extract_live_article_data(html):
+def afr_extract_live_article_data(html, data=_STATE_UNSET):
     """Extract a live blog from AFR's __staticRouterHydrationData.
 
     AFR live articles have posts in ``content.asset.posts`` and optionally
     ``content.asset.pinnedPosts``.  Each post has its own body, headline,
     byline and dates.  Posts are returned newest-first.
+
+    Pass ``data`` when the payload has already been parsed (see
+    :func:`afr_extract_article_data`).
     """
-    data = _afr_extract_hydration_data(html)
+    if data is _STATE_UNSET:
+        data = _afr_extract_hydration_data(html)
     if not data:
         return None
 
@@ -1935,19 +2081,24 @@ def afr_build_article_html(article, upstream_url):
 @app.route("/afr/<path:path>", methods=["GET"])
 def afr_proxy(path):
     """Proxy for afr.com."""
-    if request.query_string:
-        upstream = f"{AFR_UPSTREAM}/{path}?{request.query_string.decode()}"
-    else:
-        upstream = f"{AFR_UPSTREAM}/{path}" if path else AFR_UPSTREAM
+    upstream = _upstream_url(AFR_UPSTREAM, path)
 
-    log.debug("AFR Proxying: %s → %s", request.full_path, upstream)
+    log.debug("AFR Proxying: %s", upstream)
+
+    cache_key = _page_cache_key("afr")
+    hit = _cached_response(cache_key)
+    if hit is not None:
+        log.debug("AFR page cache hit: %s", request.path)
+        return hit
 
     try:
         resp = SESSION.get(upstream, headers=HEADERS, timeout=15, allow_redirects=True)
-        resp.raise_for_status()
     except requests.RequestException as e:
         log.exception("AFR: Failed to fetch upstream")
         return f"<h1>Upstream fetch failed</h1><p>{escape(e)}</p>", 502
+
+    if resp.status_code >= 400:
+        return _upstream_error_response(resp, upstream)
 
     content_type = resp.headers.get("Content-Type", "")
 
@@ -1959,16 +2110,22 @@ def afr_proxy(path):
 
     html = resp.text
 
+    # Parse the hydration payload once and share it between both extractors.
+    hydration_data = _afr_extract_hydration_data(html)
+
     # Try to extract clean article data
-    article = afr_extract_article_data(html)
+    article = afr_extract_article_data(html, hydration_data)
 
     if article and article.get("headline"):
         log.debug("AFR Clean article: %s", article["headline"])
-        rendered = afr_build_article_html(article, upstream)
-        return Response(inject_smh_ui(rendered), mimetype="text/html")
+        rendered = inject_smh_ui(afr_build_article_html(article, upstream))
+        # Clean articles are immutable once published: cache the render so a
+        # repeat read skips the upstream fetch, hydration parse and rewrite.
+        _page_cache_set(cache_key, rendered, "text/html", {}, 200)
+        return Response(rendered, mimetype="text/html")
 
     # Try to extract live blog data
-    live = afr_extract_live_article_data(html)
+    live = afr_extract_live_article_data(html, hydration_data)
 
     if live and live.get("headline"):
         log.debug("AFR Live blog: %s (%d posts)",
@@ -2053,8 +2210,10 @@ def afr_proxy(path):
 
     rewritten = inject_smh_ui(rewritten)
 
+    _page_cache_set(cache_key, rewritten, "text/html",
+                    INDEX_CACHE_HEADER, 200)
     return Response(rewritten, mimetype="text/html",
-                    headers={"Cache-Control": "no-store"})
+                    headers=INDEX_CACHE_HEADER)
 
 
 @app.route("/__more")
@@ -2114,19 +2273,24 @@ def most_viewed():
 @app.route("/<path:path>", methods=["GET"])
 def proxy(path):
     # Build upstream URL
-    if request.query_string:
-        upstream = f"{UPSTREAM}/{path}?{request.query_string.decode()}"
-    else:
-        upstream = f"{UPSTREAM}/{path}" if path else UPSTREAM
+    upstream = _upstream_url(UPSTREAM, path)
 
-    log.debug("Proxying: %s → %s", request.full_path, upstream)
+    log.debug("Proxying: %s", upstream)
+
+    cache_key = _page_cache_key("smh")
+    hit = _cached_response(cache_key)
+    if hit is not None:
+        log.debug("Page cache hit: %s", request.path)
+        return hit
 
     try:
         resp = SESSION.get(upstream, headers=HEADERS, timeout=15, allow_redirects=True)
-        resp.raise_for_status()
     except requests.RequestException as e:
         log.exception("Failed to fetch upstream")
         return f"<h1>Upstream fetch failed</h1><p>{escape(e)}</p>", 502
+
+    if resp.status_code >= 400:
+        return _upstream_error_response(resp, upstream)
 
     content_type = resp.headers.get("Content-Type", "")
 
@@ -2138,8 +2302,11 @@ def proxy(path):
 
     html = resp.text
 
-    # Try to extract clean article data (regular article or live blog)
-    article = extract_article_data(html) or extract_live_article_data(html)
+    # Try to extract clean article data (regular article or live blog).
+    # The APOLLO_STATE blob is parsed once and shared by both extractors.
+    hydration_data = _extract_apollo_state(html)
+    article = (extract_article_data(html, hydration_data)
+               or extract_live_article_data(html, hydration_data))
 
     if article and article.get("headline"):
         is_live = "posts" in article
@@ -2174,12 +2341,16 @@ def proxy(path):
             url=escape(upstream),
             embed_script=EMBED_RESIZE_SCRIPT,
         )
-        headers = {"Cache-Control": "no-store"} if is_live else {}
-        return Response(inject_smh_ui(rendered), mimetype="text/html",
-                        headers=headers)
+        body = inject_smh_ui(rendered)
+        if is_live:
+            # Live blogs change minute to minute — never cache the render.
+            return Response(body, mimetype="text/html",
+                            headers={"Cache-Control": "no-store"})
+        _page_cache_set(cache_key, body, "text/html", {}, 200)
+        return Response(body, mimetype="text/html")
 
     # Not an article — proxy with link rewriting (single pass)
-    rewritten = process_html(html, upstream + "/", NINE_DOMAINS, "", BLOCK_PATTERNS)
+    rewritten = process_html(html, upstream + "/", SMH_DOMAINS, "", BLOCK_PATTERNS)
 
     # Inject a working "Show more" button on section/index/topic pages
     req_path = "/" + path if path else "/"
@@ -2191,8 +2362,10 @@ def proxy(path):
 
     rewritten = inject_smh_ui(rewritten)
 
+    _page_cache_set(cache_key, rewritten, "text/html",
+                    INDEX_CACHE_HEADER, 200)
     return Response(rewritten, mimetype="text/html",
-                    headers={"Cache-Control": "no-store"})
+                    headers=INDEX_CACHE_HEADER)
 
 
 if __name__ == "__main__":
