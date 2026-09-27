@@ -11,6 +11,7 @@ AFR routes:  /afr , /afr/<path>
 import os
 import re
 import json
+import gzip
 import logging
 import time
 from collections import OrderedDict
@@ -29,6 +30,74 @@ SESSION = requests.Session()
 
 UPSTREAM = "https://www.smh.com.au"
 
+# ── Response compression ────────────────────────────────────────────────────
+# The origin serves gzip; we re-serialise its HTML, so without this we ship it
+# uncompressed — measured /national at 376KB against 65KB gzipped, and the SMH
+# homepage at 1.2MB against ~165KB. Cached pages pre-compress once at store
+# time, so a cache hit costs no compression CPU at all.
+GZIP_LEVEL = 4
+GZIP_MIN_BYTES = 1024
+COMPRESSIBLE_TYPES = (
+    "text/",
+    "application/json",
+    "application/javascript",
+    "application/xml",
+    "image/svg+xml",
+)
+
+
+def _is_compressible(mimetype):
+    if not mimetype:
+        return False
+    mime = mimetype.split(";", 1)[0].strip().lower()
+    return any(mime == t or mime.startswith(t) for t in COMPRESSIBLE_TYPES)
+
+
+def _client_accepts_gzip():
+    return "gzip" in request.headers.get("Accept-Encoding", "").lower()
+
+
+def _gzip(data):
+    """Compress a str/bytes body, or return None if that is not worthwhile."""
+    if not isinstance(data, bytes):
+        try:
+            data = data.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+    if len(data) < GZIP_MIN_BYTES:
+        return None
+    try:
+        return gzip.compress(data, GZIP_LEVEL)
+    except (OSError, ValueError):
+        return None
+
+
+def _add_vary(resp, value):
+    parts = [p.strip() for p in resp.headers.get("Vary", "").split(",") if p.strip()]
+    if value.lower() not in {p.lower() for p in parts}:
+        parts.append(value)
+    resp.headers["Vary"] = ", ".join(parts)
+
+
+@app.after_request
+def _compress_response(resp):
+    """Gzip responses we did not pre-compress (articles, JSON, errors)."""
+    if resp.direct_passthrough or "Content-Encoding" in resp.headers:
+        return resp
+    if not _is_compressible(resp.mimetype):
+        return resp
+    _add_vary(resp, "Accept-Encoding")
+    if not _client_accepts_gzip():
+        return resp
+    data = resp.get_data()
+    gz = _gzip(data) if len(data) >= GZIP_MIN_BYTES else None
+    if gz is None:
+        return resp
+    resp.set_data(gz)
+    resp.headers["Content-Encoding"] = "gzip"
+    return resp
+
+
 # ── Page cache: serve rendered pages from memory for 5 minutes ────────
 # Clean article renders and index/section pages are cached. Live blogs never
 # are — their content changes minute to minute.
@@ -41,7 +110,7 @@ PAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024
 INDEX_CACHE_HEADER = {"Cache-Control": "public, max-age=60"}
 # Insertion order doubles as LRU order: hits are moved to the end and the
 # oldest entry is evicted first.
-# entry -> (monotonic_ts, body, mimetype, headers, status)
+# entry -> (monotonic_ts, body, gz_body|None, mimetype, headers, status)
 _page_cache = OrderedDict()
 
 
@@ -49,7 +118,7 @@ def _page_cache_get(key):
     entry = _page_cache.get(key)
     if entry is None:
         return None
-    ts, body, mimetype, headers, status = entry
+    ts, body, gz, mimetype, headers, status = entry
     if time.monotonic() - ts > PAGE_CACHE_TTL:
         # Only drop the entry we actually read: another thread may have
         # already replaced it with a fresh one, and a bare `del` would raise
@@ -58,27 +127,53 @@ def _page_cache_get(key):
             _page_cache.pop(key, None)
         return None
     _page_cache.move_to_end(key)
-    return body, mimetype, headers, status
+    return body, gz, mimetype, headers, status
 
 
 def _page_cache_set(key, body, mimetype, headers, status):
-    """Store a rendered page."""
-    _page_cache[key] = (time.monotonic(), body, mimetype, headers, status)
+    """Store a render, pre-compressed. Returns the gzip bytes (or None)."""
+    gz = None
+    if _is_compressible(mimetype):
+        gz = _gzip(body)
+    _page_cache[key] = (time.monotonic(), body, gz, mimetype, headers, status)
     _page_cache.move_to_end(key)
     while len(_page_cache) > PAGE_CACHE_MAX_ENTRIES:
         _page_cache.popitem(last=False)
     while len(_page_cache) > 1 and sum(
-            len(e[1])
+            len(e[1]) + (len(e[2]) if e[2] else 0)
             for e in _page_cache.values()) > PAGE_CACHE_MAX_BYTES:
         _page_cache.popitem(last=False)
+    return gz
+
+
+def _cache_and_respond(key, body, mimetype, headers, status):
+    """Cache this render and return the response for it.
+
+    Serving the already-compressed bytes here means a cold request compresses
+    once (in _page_cache_set) instead of once to store and again in
+    _compress_response.
+    """
+    gz = _page_cache_set(key, body, mimetype, headers, status)
+    out_headers = dict(headers)
+    out_headers.setdefault("Vary", "Accept-Encoding")
+    if gz is not None and _client_accepts_gzip():
+        out_headers["Content-Encoding"] = "gzip"
+        return Response(gz, mimetype=mimetype, headers=out_headers, status=status)
+    return Response(body, mimetype=mimetype, headers=out_headers, status=status)
 
 
 def _cached_response(key):
-    """Serve this request's cached render. None on a miss."""
+    """Serve this request's cached render, gzip-first. None on a miss."""
     cached = _page_cache_get(key)
     if not cached:
         return None
-    body, mimetype, headers, status = cached
+    body, gz, mimetype, headers, status = cached
+    headers = dict(headers)
+    if "Vary" not in headers:
+        headers["Vary"] = "Accept-Encoding"
+    if gz is not None and _client_accepts_gzip():
+        headers["Content-Encoding"] = "gzip"
+        return Response(gz, mimetype=mimetype, headers=headers, status=status)
     return Response(body, mimetype=mimetype, headers=headers, status=status)
 
 
@@ -307,8 +402,8 @@ def _strip_named_sections(soup):
 
 def _strip_footer_below_socials(soup):
     """Remove footer content that sits below the social media links."""
-    footers = soup.find_all("footer") + soup.select(
-        '#footer, [data-testid="footer"]')
+    footers = soup.find_all("footer") + _elements_matching(
+        soup, ['#footer, [data-testid="footer"]'])
     seen = set()
     for footer in footers:
         if id(footer) in seen:
@@ -345,6 +440,238 @@ PAYWALL_SELECTORS = [
 PAYWALL_CLASS_RE = re.compile(r"paywall|subscribe-prompt|regwall|gateway|meter-wall", re.I)
 PAYWALL_ID_RE = re.compile(r"piano|tp-|tif-wrapper", re.I)
 ADSPOT_ID_RE = re.compile(r"adspot|ad-slot|consent|cookie", re.I)
+
+# ── Native replacement for soup.select() on the simple selectors above ──────
+# soupsieve (BeautifulSoup's CSS engine) re-walks the whole tree once per
+# selector. Measured on smh.com.au/ that is 207ms of a 352ms process_html —
+# 59% of all processing — for 26 selectors. Every selector we use is a plain
+# tag / #id / .class / [attr...] test with no combinators, so a single native
+# walk with cheap predicates produces the identical element set.
+_SELECTOR_PART_RE = re.compile(
+    r"""(?P<tag>[a-zA-Z][\w-]*)
+       | \#(?P<id>[\w-]+)
+       | \.(?P<cls>[\w-]+)
+       | \[(?P<attr>[a-zA-Z][\w-]*)(?P<op>\^=|\*=|=)"(?P<val>[^"]*)"(?P<ci>\s*i)?\]
+    """,
+    re.X,
+)
+
+
+def _attr_values(tag, names):
+    """Read the attributes the selector set cares about, once per element.
+
+    ``class`` is normalised to a token tuple (bs4 parses it to a list) so the
+    per-selector predicates are plain membership tests with no string work.
+    """
+    vals = {}
+    for name in names:
+        val = tag.get(name)
+        if name == "class":
+            if isinstance(val, str):
+                val = tuple(val.split())
+            elif isinstance(val, list):
+                val = tuple(val)
+            else:
+                val = ()
+        vals[name] = val
+    return vals
+
+
+def _vals_str(vals, name):
+    """Attribute value as a string for prefix/substring tests."""
+    val = vals.get(name)
+    if val is None:
+        return ""
+    if isinstance(val, (list, tuple)):
+        return " ".join(val)
+    return val
+
+
+def _compile_selector(sel):
+    """Compile one combinator-free CSS selector.
+
+    Returns ``(attrs_needed, test, bucketable)`` where ``test(vals, tag)``
+    reads its attributes from the pre-read ``vals`` dict (see
+    :func:`_attr_values`). ``bucketable`` is False when some comparison
+    value is empty — a missing attribute would then look like a match, so
+    the caller may not skip the test on absent attributes.
+
+    Raises ValueError for selector features we do not translate; callers
+    fall back to ``soup.select`` for those.
+    """
+    tests = []
+    needed = set()
+    bucketable = True
+    pos = 0
+    for m in _SELECTOR_PART_RE.finditer(sel):
+        if m.start() != pos:
+            raise ValueError(f"unsupported selector: {sel!r}")
+        pos = m.end()
+        if m.group("tag"):
+            name = m.group("tag").lower()
+            tests.append(lambda vals, el, n=name: el.name == n)
+        elif m.group("id"):
+            needed.add("id")
+            want = m.group("id")
+            bucketable = bucketable and bool(want)
+            tests.append(lambda vals, el, w=want: vals.get("id") == w)
+        elif m.group("cls"):
+            needed.add("class")
+            want = m.group("cls")
+            bucketable = bucketable and bool(want)
+            tests.append(lambda vals, el, w=want: w in vals["class"])
+        else:
+            attr = m.group("attr")
+            op = m.group("op")
+            want = m.group("val")
+            ci = bool(m.group("ci"))
+            needed.add(attr)
+            bucketable = bucketable and bool(want)
+            if op == "=":
+                if ci:
+                    want = want.lower()
+                    tests.append(
+                        lambda vals, el, a=attr, w=want:
+                        _vals_str(vals, a).lower() == w)
+                else:
+                    tests.append(
+                        lambda vals, el, a=attr, w=want: _vals_str(vals, a) == w)
+            elif op == "^=":
+                tests.append(
+                    lambda vals, el, a=attr, w=want: _vals_str(vals, a).startswith(w))
+            else:  # "*="
+                if ci:
+                    want = want.lower()
+                    tests.append(
+                        lambda vals, el, a=attr, w=want:
+                        w in _vals_str(vals, a).lower())
+                else:
+                    tests.append(
+                        lambda vals, el, a=attr, w=want: w in _vals_str(vals, a))
+    if not tests or pos != len(sel):
+        raise ValueError(f"unsupported selector: {sel!r}")
+
+    def test(vals, el):
+        return all(t(vals, el) for t in tests)
+
+    return needed, test, bucketable
+
+
+def _split_selector_list(sel):
+    """Split a comma-separated selector list, ignoring commas in [...] and quotes."""
+    parts, buf, depth, quote = [], "", 0, None
+    for ch in sel:
+        if quote:
+            buf += ch
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf += ch
+        elif ch == "[":
+            depth += 1
+            buf += ch
+        elif ch == "]":
+            depth = max(0, depth - 1)
+            buf += ch
+        elif ch == "," and depth == 0:
+            if buf.strip():
+                parts.append(buf.strip())
+            buf = ""
+        else:
+            buf += ch
+    if buf.strip():
+        parts.append(buf.strip())
+    return parts
+
+
+def _elements_matching(soup, selectors):
+    """All elements matching any selector, via one native walk.
+
+    Selectors we cannot translate fall back to ``soup.select`` so behaviour
+    is never lost — only the fast path is conditional.
+
+    Tests are bucketed by the attribute they read, so an element only runs
+    the predicates whose attribute it actually carries. On the SMH homepage
+    that is ~3x fewer predicate calls than evaluating all of them.
+    """
+    always, by_attr, lazy, names = [], {}, [], set()
+    for sel in selectors:
+        for part in _split_selector_list(sel):
+            try:
+                needed, test, bucketable = _compile_selector(part)
+            except ValueError:
+                lazy.append(part)
+                continue
+            names.update(needed)
+            if needed and bucketable:
+                for attr in needed:
+                    by_attr.setdefault(attr, []).append(test)
+            else:
+                always.append(test)
+
+    matches = []
+    if always or by_attr:
+        attr_names = tuple(names)
+        find_all = soup.find_all
+        for el in find_all(True):
+            vals = _attr_values(el, attr_names)
+            if any(t(vals, el) for t in always):
+                matches.append(el)
+                continue
+            for attr, group in by_attr.items():
+                # Absent (or empty) attribute -> every test in the bucket
+                # fails anyway, so skip the whole group.
+                if not vals.get(attr):
+                    continue
+                if any(t(vals, el) for t in group):
+                    matches.append(el)
+                    break
+    for part in lazy:
+        matches.extend(soup.select(part))
+
+    if not matches:
+        return matches
+    seen = set()
+    unique = []
+    for el in matches:
+        if id(el) not in seen:
+            seen.add(id(el))
+            unique.append(el)
+    return unique
+
+
+def _strip_matching(soup, selectors):
+    """Decompose every element matching any selector.
+
+    Equivalent to running each selector as its own ``soup.select`` pass:
+    the removed set is always the union of the matched subtrees, so
+    ancestor/descendant overlaps do not change the resulting tree. The
+    nesting decision is made before any decompose() so a node is never
+    decomposed twice.
+    """
+    matches = _elements_matching(soup, selectors)
+    if not matches:
+        return 0
+
+    doomed = {id(el) for el in matches}
+    nested = set()
+    for el in matches:
+        parent = el.parent
+        while parent is not None:
+            if id(parent) in doomed:
+                nested.add(id(el))
+                break
+            parent = parent.parent
+
+    removed = 0
+    for el in matches:
+        if id(el) not in nested:
+            el.decompose()
+            removed += 1
+    return removed
+
 
 # Markers identifying a framework hydration payload rather than a paywall or
 # tracker script. Matched against the lowercased inline script body:
@@ -402,10 +729,10 @@ def process_html(html, base_url, domains, prefix, block_patterns,
         if any(p.search(href) for p in block_patterns):
             tag.decompose()
 
-    # Paywall / partner / ad element removal
-    for selector in PAYWALL_SELECTORS + AD_SELECTORS + PARTNER_SELECTORS + STRIP_SELECTORS:
-        for el in soup.select(selector):
-            el.decompose()
+    # Paywall / partner / ad element removal. One native walk instead of a
+    # full soupsieve pass per selector (see _strip_matching).
+    _strip_matching(
+        soup, PAYWALL_SELECTORS + AD_SELECTORS + PARTNER_SELECTORS + STRIP_SELECTORS)
 
     # Remove empty wrapper shells left behind after ad stripping
     # (e.g. the header banner div that only contained an ad slot).
@@ -452,10 +779,18 @@ _STATE_UNSET = object()
 
 
 def _extract_apollo_state(html):
-    """Parse ``window.APOLLO_STATE = {...}`` from a page's inline scripts."""
+    """Parse ``window.APOLLO_STATE = {...}`` from a page's inline scripts.
+
+    The marker check comes first: index pages carry no APOLLO_STATE, and
+    without it this walked and copied every inline script body (~10ms) only
+    to find nothing.
+    """
+    if "window.APOLLO_STATE" not in html:
+        return None
     for m in APOLLO_SCRIPT_RE.finditer(html):
         text = m.group(1)
-        idx = text.find("window.APOLLO_STATE")
+        marker = "window.APOLLO_STATE"
+        idx = text.find(marker)
         if idx == -1:
             continue
         eq = text.find("=", idx)
@@ -809,16 +1144,43 @@ def blocks_to_html(blocks, asset_urls=None):
 
 
 def _parse_initial_state(html):
-    """Parse ``window.INITIAL_STATE = JSON.parse("...")`` from the page."""
-    m = re.search(
-        r'window\.INITIAL_STATE\s*=\s*JSON\.parse\("((?:[^"\\]|\\.)*)"\)',
-        html, re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(json.loads('"' + m.group(1) + '"'))
-    except (json.JSONDecodeError, ValueError):
-        return None
+    """Parse ``window.INITIAL_STATE = JSON.parse("...")`` from the page.
+
+    Uses a C-level ``find`` plus ``json.JSONDecoder.raw_decode`` instead of a
+    regex that captures the whole 700KB payload into a Python string and then
+    copies it twice more (measured: 76ms on the SMH homepage).
+
+    Behaviour is identical to that regex: only the ``JSON.parse("...")`` form
+    is accepted (article pages carry a bare object literal, which was — and
+    remains — ignored), and a payload that fails to decode stops the search
+    rather than falling through to a later occurrence.
+    """
+    marker = "window.INITIAL_STATE"
+    marker_len = len(marker)
+    parse_prefix = 'JSON.parse("'
+    idx = html.find(marker)
+    while idx != -1:
+        p = idx + marker_len
+        while p < len(html) and html[p] in " \t\r\n":
+            p += 1
+        if p < len(html) and html[p] == "=":
+            value = p + 1
+            while value < len(html) and html[value] in " \t\r\n":
+                value += 1
+            if html.startswith(parse_prefix, value):
+                # raw_decode expects to start *at* the opening quote.
+                start = value + len(parse_prefix) - 1
+                try:
+                    encoded, end = json.JSONDecoder().raw_decode(html, start)
+                except (json.JSONDecodeError, ValueError, IndexError):
+                    return None
+                if end < len(html) and html[end] == ")":
+                    try:
+                        return json.loads(encoded)
+                    except (json.JSONDecodeError, ValueError):
+                        return None
+        idx = html.find(marker, idx + 1)
+    return None
 
 
 def _iter_index_asset_ids(page_data):
@@ -2121,8 +2483,7 @@ def afr_proxy(path):
         rendered = inject_smh_ui(afr_build_article_html(article, upstream))
         # Clean articles are immutable once published: cache the render so a
         # repeat read skips the upstream fetch, hydration parse and rewrite.
-        _page_cache_set(cache_key, rendered, "text/html", {}, 200)
-        return Response(rendered, mimetype="text/html")
+        return _cache_and_respond(cache_key, rendered, "text/html", {}, 200)
 
     # Try to extract live blog data
     live = afr_extract_live_article_data(html, hydration_data)
@@ -2210,10 +2571,8 @@ def afr_proxy(path):
 
     rewritten = inject_smh_ui(rewritten)
 
-    _page_cache_set(cache_key, rewritten, "text/html",
-                    INDEX_CACHE_HEADER, 200)
-    return Response(rewritten, mimetype="text/html",
-                    headers=INDEX_CACHE_HEADER)
+    return _cache_and_respond(cache_key, rewritten, "text/html",
+                              INDEX_CACHE_HEADER, 200)
 
 
 @app.route("/__more")
@@ -2346,8 +2705,7 @@ def proxy(path):
             # Live blogs change minute to minute — never cache the render.
             return Response(body, mimetype="text/html",
                             headers={"Cache-Control": "no-store"})
-        _page_cache_set(cache_key, body, "text/html", {}, 200)
-        return Response(body, mimetype="text/html")
+        return _cache_and_respond(cache_key, body, "text/html", {}, 200)
 
     # Not an article — proxy with link rewriting (single pass)
     rewritten = process_html(html, upstream + "/", SMH_DOMAINS, "", BLOCK_PATTERNS)
@@ -2362,10 +2720,8 @@ def proxy(path):
 
     rewritten = inject_smh_ui(rewritten)
 
-    _page_cache_set(cache_key, rewritten, "text/html",
-                    INDEX_CACHE_HEADER, 200)
-    return Response(rewritten, mimetype="text/html",
-                    headers=INDEX_CACHE_HEADER)
+    return _cache_and_respond(cache_key, rewritten, "text/html",
+                              INDEX_CACHE_HEADER, 200)
 
 
 if __name__ == "__main__":
