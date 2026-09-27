@@ -2037,6 +2037,32 @@ def _afr_resolve_placeholders(body, placeholders):
                 return f'<a href="{escape(url)}"{target}>{text}</a>'
             return text
 
+        elif ptype == "linkArticle":
+            # Inline in-text link to another AFR story. `text` is the
+            # surrounding sentence fragment stored as HTML by the CMS, so it
+            # must be preserved even if the story can't be resolved.
+            story_id = data.get("id", "")
+            text = data.get("text", "")
+            if story_id:
+                path, _headline = _afr_resolve_story(story_id)
+                if path:
+                    return f'<a href="/afr{escape(path)}">{text}</a>'
+            return text
+
+        elif ptype == "iframe":
+            url = data.get("url", "")
+            if not url:
+                return ""
+            # Route AFR-hosted embeds (charts, interactive stories) through
+            # the proxy so their own asset requests also bypass the paywall.
+            if url.startswith(AFR_UPSTREAM + "/"):
+                url = "/afr" + url[len(AFR_UPSTREAM):]
+            return (
+                f'<div class="embed"><iframe src="{escape(url)}" scrolling="no" '
+                f'frameborder="0" title="Interactive embed" '
+                f'style="width:100%;border:0;min-height:420px"></iframe></div>'
+            )
+
         elif ptype == "relatedStory":
             story_id = data.get("id", "")
             if story_id:
@@ -2051,7 +2077,8 @@ def _afr_resolve_placeholders(body, placeholders):
                 return f'<p class="related"><strong>Related:</strong> <a href="https://www.afr.com/{story_id}">Related story</a></p>'
             return ""
 
-        return ""
+        # Unknown placeholder type — don't silently drop any text it carries.
+        return data.get("text", "")
 
     body = re.sub(r"<x-placeholder[^>]*>.*?</x-placeholder>", replacer, body, flags=re.DOTALL)
     body = re.sub(r"<x-placeholder[^>]*/?>", replacer, body)
