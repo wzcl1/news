@@ -53,4 +53,4 @@ docker compose up -d --build
 - `app.py` — the entire proxy (Flask app, HTML cleanup, GraphQL clients).
 - `Dockerfile` — `python:3.12-slim` + requirements.
 - `docker-compose.yml` — service definition, port 5008, `edge` network.
-- `requirements.txt` — flask, requests, beautifulsoup4.
+- `requirements.txt` — flask, requests, beautifulsoup4, waitress.

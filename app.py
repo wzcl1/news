@@ -2725,9 +2725,11 @@ def proxy(path):
 
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=5008,
-        debug=os.environ.get("SMH_DEBUG") == "1",
-        use_reloader=os.environ.get("SMH_DEBUG") == "1",
-    )
+    if os.environ.get("SMH_DEBUG") == "1":
+        app.run(host="0.0.0.0", port=5008, debug=True, use_reloader=True)
+    else:
+        from waitress import serve
+
+        serve(app, host="0.0.0.0", port=5008,
+              threads=int(os.environ.get("SMH_THREADS", "16")),
+              ident="smh-proxy")
