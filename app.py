@@ -1797,13 +1797,31 @@ def strip_promos(html):
 
 EMBED_RESIZE_SCRIPT = """<script>
 window.addEventListener('message', function (e) {
-  var heights = e.data && e.data['datawrapper-height'];
-  if (!heights) return;
-  var frames = document.querySelectorAll('iframe');
-  for (var key in heights) {
-    for (var i = 0; i < frames.length; i++) {
-      if (frames[i].contentWindow === e.source) {
-        frames[i].style.height = heights[key] + 'px';
+  var d = e.data;
+  if (!d) return;
+  var height = null;
+  // Datawrapper-style {"datawrapper-height": {"<frame id>": N}}
+  var heights = d['datawrapper-height'];
+  if (heights) {
+    var frames = document.querySelectorAll('iframe');
+    for (var key in heights) {
+      for (var i = 0; i < frames.length; i++) {
+        if (frames[i].contentWindow === e.source) {
+          frames[i].style.height = heights[key] + 'px';
+        }
+      }
+    }
+    return;
+  }
+  // AFR/ffx iframe messenger: {sentinel:"amp", type:"embed-size", height:N}
+  if (d.sentinel === 'amp' && d.type === 'embed-size' &&
+      (typeof d.height === 'number' || typeof d.height === 'string')) {
+    var h = parseInt(d.height, 10);
+    if (isNaN(h)) return;
+    var f2 = document.querySelectorAll('iframe');
+    for (var j = 0; j < f2.length; j++) {
+      if (f2[j].contentWindow === e.source) {
+        f2[j].style.height = h + 'px';
       }
     }
   }
@@ -2496,7 +2514,13 @@ def afr_proxy(path):
 
     # Only rewrite HTML responses
     if "text/html" not in content_type:
-        return Response(resp.content,
+        body = resp.content
+        # The Flourish wrapper builds the inner chart-iframe src from
+        # flo.uri.sh. Route it through /__flourish so article links inside
+        # the embed are rewritten to the proxy (see flourish_proxy).
+        if "flourish-embed-utils.js" in path and "javascript" in content_type:
+            body = body.replace(b"https://flo.uri.sh/", b"/__flourish/")
+        return Response(body,
                        content_type=content_type,
                        headers={"Cache-Control": "public, max-age=300"})
 
@@ -2599,7 +2623,12 @@ def afr_proxy(path):
         log.debug("AFR pagination page %s — injecting show more", req_path)
         rewritten = inject_show_more(rewritten, page_meta)
 
-    rewritten = inject_smh_ui(rewritten)
+    # Don't add the proxy nav bar to pages loaded inside an <iframe>
+    # (interactive embeds) — it only takes up space there.
+    in_frame = (path.startswith("interactive/")
+                or request.headers.get("Sec-Fetch-Dest") == "iframe")
+    if not in_frame:
+        rewritten = inject_smh_ui(rewritten)
 
     return _cache_and_respond(cache_key, rewritten, "text/html",
                               INDEX_CACHE_HEADER, 200)
@@ -2637,6 +2666,42 @@ def more():
         "nextCursor": page_info.get("endCursor"),
         "hasNextPage": bool(page_info.get("hasNextPage")),
     }
+
+
+@app.route("/__flourish/<path:rest>")
+def flourish_proxy(rest):
+    """Proxy for flo.uri.sh embed pages.
+
+    AFR (and SMH) articles embed Flourish "cards" visualisations whose data
+    is a list of links to articles on the origin — which would hit the
+    paywall. Serve the embed page through the proxy and map those URLs onto
+    the proxy routes so every link in the embed stays paywall-free.
+    """
+    upstream = f"https://flo.uri.sh/{rest}"
+    if request.query_string:
+        upstream += "?" + request.query_string.decode()
+    try:
+        resp = SESSION.get(upstream, headers=HEADERS, timeout=15,
+                           allow_redirects=True)
+    except requests.RequestException as e:
+        log.exception("Flourish: Failed to fetch upstream")
+        return f"<h1>Upstream fetch failed</h1><p>{escape(e)}</p>", 502
+
+    if resp.status_code >= 400:
+        return _upstream_error_response(resp, upstream)
+
+    content_type = resp.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        body = resp.text
+        for old, new in (("https://www.afr.com", "/afr"),
+                         ("http://www.afr.com", "/afr"),
+                         ("https://www.smh.com.au", "/"),
+                         ("http://www.smh.com.au", "/")):
+            body = body.replace(old, new)
+        return Response(body, content_type=content_type,
+                        headers={"Cache-Control": "public, max-age=300"})
+    return Response(resp.content, content_type=content_type,
+                    headers={"Cache-Control": "public, max-age=300"})
 
 
 @app.route("/__mostviewed")
@@ -2748,7 +2813,10 @@ def proxy(path):
                   page_meta.get("path"), page_meta.get("kind"))
         rewritten = inject_show_more(rewritten, page_meta)
 
-    rewritten = inject_smh_ui(rewritten)
+    # Don't add the proxy nav bar to pages loaded inside an <iframe>
+    # (interactive embeds) — it only takes up space there.
+    if request.headers.get("Sec-Fetch-Dest") != "iframe":
+        rewritten = inject_smh_ui(rewritten)
 
     return _cache_and_respond(cache_key, rewritten, "text/html",
                               INDEX_CACHE_HEADER, 200)
